@@ -1,0 +1,9 @@
+<map version="1.0.1">
+<!-- To view this file, download free mind mapping software FreeMind from http://freemind.sourceforge.net -->
+<node CREATED="1476061827314" ID="ID_1239446941" MODIFIED="1476061836507" TEXT="CPA">
+<node CREATED="1476061837248" ID="ID_755010640" MODIFIED="1476061847643" POSITION="right" TEXT="&#x7ecf;&#x6d4e;&#x6cd5;"/>
+<node CREATED="1476061848153" ID="ID_1207182380" MODIFIED="1476062016610" POSITION="right" TEXT="&#x4f1a;&#x8ba1;"/>
+<node CREATED="1476062017929" ID="ID_1911216159" MODIFIED="1476062020635" POSITION="right" TEXT="&#x5ba1;&#x8ba1;"/>
+<node CREATED="1476062021173" ID="ID_425472680" MODIFIED="1476062021173" POSITION="right" TEXT=""/>
+</node>
+</map>
