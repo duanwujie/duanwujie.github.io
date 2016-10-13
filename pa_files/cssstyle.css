@@ -1,0 +1,44 @@
+.mainfont {
+	font-size: 15px;
+	line-height: 28px;
+}
+.mainfontblue {
+	font-size: 15px;
+	line-height: 22px;
+	font-weight: bold;
+	color: #003399;
+}
+.smallblue {
+	font-size: 12px;
+	line-height: 20px;
+	color: #0066CC;
+	font-weight: normal;
+
+}
+a:link {
+	color: #000000;
+}
+a:hover {
+	color: #FF9933;
+}
+a:active {
+	color: #990000;
+}
+.biaotilink {
+	font-size: 13px;
+	line-height: 22px;
+	color: #FFFFFF;
+}
+.biaoti {
+	font-size: 16px;
+	font-weight: bold;
+	color: #000000;
+}
+.fontred {
+	color: #990000;
+	font-weight: normal;
+
+}
+a:visited {
+	color: #3366FF;
+}
