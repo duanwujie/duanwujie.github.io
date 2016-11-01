@@ -1,0 +1,15 @@
+
+EURUSD:
+	.Buy entry:
+		toptrend goto up trend and cjdx up cross
+	.Buy exit:
+		toptrend goto down or cjdx down cross or target reached
+	.Sell entry
+		toptrend goto down trend and cjdx down cross
+	.Sell exit:
+		toptrend goto up or cjdx up cross or target reached.
+	
+
+
+	
+	
