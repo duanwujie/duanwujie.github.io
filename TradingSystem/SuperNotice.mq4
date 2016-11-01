@@ -66,9 +66,7 @@ int OnCalculate(const int rates_total,
          
 
    if(t1 < Bid && t2 > (EMPTY_VALUE-1))
-   {
-      iWaring(0,BUY_DIRECTION,t1);//Notice
-      
+   {      
       trend = 1;
       if(Cross(p2,p1,c2,c1)>0)
       {
