@@ -1,0 +1,595 @@
+
+<!DOCTYPE HTML>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>RFC-2461 IPv6 NDP中NA延时的一个实现方案：异步/多实例/实时性 - One Man's Yammer</title>
+	<meta name="author" content="Yafang Shao">
+
+	
+	<meta name="description" content="RFC-2461 IPv6 NDP中NA延时的一个实现方案：异步/多实例/实时性 背景 最近为了实现NDP(Neighbor Discovery Protocol)里头proxy延迟的问题，去看了一下RFC-2461，以及思考了下如果要实现Multiple instance NDP应该怎么做扩展 &hellip;">
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+	<link href="" rel="alternate" title="One Man's Yammer" type="application/atom+xml">
+	<link rel="canonical" href="">
+	<link href="/favicon.png" rel="shortcut icon">
+	<link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+	<!--[if lt IE 9]><script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+	<script async="true" src="//ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+	
+</head>
+
+
+<body>
+	<header id="header" class="inner"><h1><a href="/">One Man's Yammer</a></h1>
+<nav id="main-nav"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</nav>
+<nav id="mobile-nav"> <ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+ </nav>
+<!--	<div class="menu"> --!>
+		<!--<a class="button">Menu</a>
+		<div class="container"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</div>--!>
+	<!--</div>--!>
+<!--</nav>--!>
+<!-- @yfshao
+	<div class="alignright search">
+		<a class="button"></a>
+		<div class="container">
+			<form action="false" method="get">
+				<input type="text" name="q" results="0">
+				<input type="hidden" name="q" value="site:laoar.github.io">
+			</form>
+		</div>
+	</div>
+</nav>
+--!>
+<!--
+<nav id="sub-nav" class="alignright">
+	<div class="social">
+		
+		
+		
+		
+    
+		
+		
+		
+		
+		
+    
+	</div>
+	<form class="search" action="false" method="get">
+		<input class="alignright" type="text" name="q" results="0">
+		<input type="hidden" name="q" value="site:laoar.github.io">
+	</form>
+</nav>
+--!>
+<!----!>
+</header>
+	
+		
+	
+	<div id="content" class="inner"><article class="post">
+	<h2 class="title">RFC-2461 IPv6 NDP中NA延时的一个实现方案：异步/多实例/实时性</h2>
+	<div class="entry-content"><h2>背景</h2>
+
+<p>最近为了实现NDP(Neighbor Discovery Protocol)里头proxy延迟的问题，去看了一下RFC-2461，以及思考了下如果要实现Multiple instance NDP应该怎么做扩展。</p>
+
+<h2>知识介绍</h2>
+
+<p>在最新的<a href="https://github.com/freebsd/freebsd">iFreeBSD(FeeBSD 11.X)</a>代码里依然没有实现<a href="http://www.ietf.org/rfc/rfc2461.txt">RFC-2461</a>中规定的对于anycast或者proxy类型的NS包在回NA的时候需要一个小于1S的随机时间的延时:  <br/>
+&ldquo;If the Target Address is an anycast address the sender SHOULD delay
+sending a response for a random time between 0 and  MAX_ANYCAST_DELAY_TIME seconds.&rdquo;  <br/>
+  其中，MAX_ANYCAST_DELAY_TIME为1 second.   <br/>
+大致意思就是说，对于接受到的每一个NS包，需要回一个NA给对端。对于anycast或者proxy这种类型的包，再回NA的时候需要一个时间延迟，该延时时一个小于1S的随机时间。</p>
+
+<p>引入延迟的主要原因是为了使代理的邻居项的优先级比其他授权的主机（例如，实际拥有Solicited L3地址的主机）的低。延迟时间是一个随机数的原因是，随机数的使用可以降低多个主机同时发出请求，并导致拥塞的可能。</p>
+
+<p>FreeBSD的代码具体参见下面这个函数：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'>  <span class="cm">/*</span>
+</span><span class='line'><span class="cm">   * Neighbor advertisement input handling.</span>
+</span><span class='line'><span class="cm">   *</span>
+</span><span class='line'><span class="cm">   * Based on RFC 2461</span>
+</span><span class='line'><span class="cm">   * Based on RFC 2462 (duplicate address detection)</span>
+</span><span class='line'><span class="cm">   *</span>
+</span><span class='line'><span class="cm">   * the following items are not implemented yet:</span>
+</span><span class='line'><span class="cm">   * - proxy advertisement delay rule (RFC2461 7.2.8, last paragraph, SHOULD)</span>
+</span><span class='line'><span class="cm">   * - anycast advertisement delay rule (RFC2461 7.2.7, SHOULD)</span>
+</span><span class='line'><span class="cm">   */</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span> <span class="nf">nd6_na_input</span><span class="p">(</span><span class="k">struct</span> <span class="n">mbuf</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">int</span> <span class="n">off</span><span class="p">,</span> <span class="kt">int</span> <span class="n">icmp6len</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在Kernel里头对于延时的一个做法是借助一个timer机制：即我们启动一个定时器，给定时器设置一个超时时间，然后在定时器超时后去执行相应的操作。我们对这个场景做一些简化，只需要如下三个timer的API：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/* 初始化一个timer */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="cm">/* 启动timer，ticks是timer多长时间超时，超时后去执行func这个函数，arg是传递给func的参数 */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_start</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span> <span class="kt">int</span> <span class="n">ticks</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">func</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="cm">/* 强制终止一个timer，用在处理异常情况 */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_stop</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>一个简单的实现</h2>
+
+<p>然后我们假设NA要执行的函数是anycast_delay_handler, 用到的参数na_arg,.    <br/>
+那么我们可以做如下一个大致实现:</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">anycast_delay_timer</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span><span class="p">));</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">timer</span> <span class="o">=</span> <span class="n">anycast_delay_timer</span><span class="p">;</span> <span class="cm">/* need free it in the async function */</span>
+</span><span class='line'>        <span class="n">jtimer_init</span><span class="p">(</span><span class="n">anycast_delay_timer</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">jtimer_start</span><span class="p">(</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="nl">freeit:</span>
+</span><span class='line'>    <span class="err">…</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">;</span>
+</span><span class='line'>     <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="n">free</span><span class="p">(</span><span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明：</p>
+
+<ol>
+<li>anycast_delay_handler 是一个异步函数，即启动timer的函数nd6_na_input()不用等待该函数执行就直接返回，这也是timer的一种做法。 如果是同步函数，那就得等待该函数执行完毕后，nd6_na_input()再返回。</li>
+<li>由于anycast_delay_handler是异步函数，所以这个local timer就不能分配在栈空间，必须分配在堆空间，然后在timer超时后再在anycast_delay_handler里面free掉该timer。</li>
+<li>但是这种做法不太scalable，它的扩展性比较差。比如我们要想强制stop该timer就不是很好处理。通常我们都是把timer来定义为一个全局变量，而不是局部变量，然后让timer分时对处理各个任务。我们可以看到在Linux Kerrnel里头，NDP/ARP都是有一个全局的neighbor table，比如ndp_tbl, arp_tbl，也就是每个协议在内核协议栈里面都是单实例的，所以对于NDP我们最好只使用一个timer，而不是每个packet都创建一个timer。</li>
+<li>HZ这个值是可以配置的，用来表示时钟中断的频率，即1S有HZ个时钟中断。在Kernel里面一般默认为100或者1000. 这里(randome() % HZ)表示最大1S的时间。</li>
+</ol>
+
+
+<h2>可扩展性考虑</h2>
+
+<p>所以，为了scalable考虑，我们还是得将该timer定义为一个全局的timer。  <br/>
+static struct timer anycast_delay_timer; /<em> 定义为一个static变量 </em>/    <br/>
+由于timeout handler跟start timer的函数是异步的，一旦定义为全局timer后，就要面临一个异步问题：在一个新的NS包到来后前一个NS包的NA的timer可能还没有超时，那么这个新的NA包去start这个timer就会出现问题。所以我们必须把需要发送的NS包都给添加到一个链表里面，然后该timer去这个链表里面去取。
+这可以借助FreeBSD的TAILQ机制来实现。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">struct</span> <span class="n">na_struct_t</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="cm">/* 放到一个TAILQ里头 */</span>
+</span><span class='line'>    <span class="n">TAILQ_ENTRY</span><span class="p">(</span><span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_delay_list</span><span class="p">;</span>
+</span><span class='line'><span class="p">};</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">TAILQ_HEAD</span><span class="p">(</span><span class="n">anycast_list_</span><span class="p">,</span> <span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_list</span> <span class="o">=</span> <span class="n">TAILQ_HEAD_INITIALIZER</span><span class="p">(</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">static</span> <span class="k">struct</span> <span class="n">timer</span> <span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'><span class="k">static</span> <span class="n">boolean</span> <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'><span class="cm">/* the max members in the anycast_delay_list */</span>
+</span><span class='line'><span class="cp">#define ANYCAST_DELAY_MAX_LEN 64</span>
+</span><span class='line'><span class="cm">/* anycast/proxy delay list length */</span>
+</span><span class='line'><span class="kt">int</span> <span class="n">anycast_delay_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">na_struct_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="n">set_na</span><span class="p">(...);</span>
+</span><span class='line'>        <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast_delay_len</span> <span class="o">&gt;</span> <span class="n">ANYCAST_DELAY_MAX_LEN</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">TAILQ_INSERT_TAIL</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">anycast_delay_len</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">timer_running</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+</span><span class='line'>            <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="cm">/* once this function is executed, the tail should not be empty */</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="n">na</span> <span class="o">=</span> <span class="n">TAILQ_FIRST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">TAILQ_REMOVE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">anycast_delay_len</span><span class="o">--</span><span class="p">;</span>
+</span><span class='line'>    <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">TAILQ_EMPTY</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">))</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="cm">/* 还有NA需要send， 所以重启定时器 */</span>
+</span><span class='line'>        <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 没有NA了，所以NS里面可以启动定时器了 */</span>
+</span><span class='line'>        <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明：</p>
+
+<ol>
+<li>在timeout函数的尾部判断是否需要重启定时器，这样来一个一个的处理TAILQ里面的元素</li>
+<li>这个TAILQ是一个全局的链表，所以需要考虑到并行问题，在对这个链表操作时需要加锁。 这个锁的粒度有些大，可以更改的更加小粒度一些，比如只要锁住插入/删除位置即可。定时器超时函数是在软中断中执行的，它不是进程上下文，所以不能执行休眠和调度。所以在timeout函数里面访问共享数据的时候，不能使用mutex来加锁，要使用spinlock来加锁。(mutex会睡眠，spinlock则是一直忙等)</li>
+<li>在往这个链表里面添加元素时，得确保这个链表不会很长，否则就导致占用太多资源，而且NA也不能及时的发送出去。所以我们得为这个链表设置一个最大长度，比如64. 如果超出这个值，就直接简单的丢弃掉这个包，这个网络处理的机制是一致的，网络太繁忙处理不过来，所以直接丢弃</li>
+</ol>
+
+
+<p>由于将所有的NA包都添加到了一个链表中来处理，那么就有可能导致链表很长，然后链表尾部的元素就可能花费N*delay(N为链表里面总的元素数)，这个时间就可能会远大于1s，这就跟RFC的标准不一致。所以得重新思考一个算法，使得确保这个时间小于1S。另外，由于FreeBSD/Linux是非实时的系统，所以还得考虑到这个时间误差。</p>
+
+<h2>基于时间的考虑</h2>
+
+<p>所谓实时操作系统是指，如果一个任务需要执行，它会立即得到执行，而不会有时间延迟。对于Linux/FreeBSD这类系统而言，任务的执行都是依赖于时钟中断引起的调度，各个任务会有自己的优先级，在调度的时候会根据优先级来选择某一个任务得到执行，而且任务必须得等到时钟中断到来才可能得到执行机会，这就导致Linux/FreeBSD是非实时的。 考虑到这个因素，anycast/proxy的delay时间最好设置为一个小于1S的随机时间，比如最大为1s * (8 / 10)。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/* the max members in the anycast_delay_list */</span>
+</span><span class='line'><span class="cp">#define ANYCAST_DELAY_MAX_LEN 64</span>
+</span><span class='line'><span class="cm">/* anycast/proxy delay list length */</span>
+</span><span class='line'><span class="kt">int</span> <span class="n">anycast_delay_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">struct</span> <span class="n">na_struct_t</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">expire</span><span class="p">;</span> <span class="cm">/*这个包需要延时发送的时刻 */</span>
+</span><span class='line'>    <span class="n">TAILQ_ENTRY</span><span class="p">(</span><span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_delay_list</span><span class="p">;</span> <span class="cm">/* 放到一个TAILQ里头 */</span>
+</span><span class='line'><span class="p">};</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">TAILQ_HEAD</span><span class="p">(</span><span class="n">anycast_list_</span><span class="p">,</span> <span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_list</span> <span class="o">=</span> <span class="n">TAILQ_HEAD_INITIALIZER</span><span class="p">(</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">static</span> <span class="k">struct</span> <span class="n">timer</span> <span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'><span class="k">static</span> <span class="n">boolean</span> <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">na_struct_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="n">set_na</span><span class="p">(...);</span>
+</span><span class='line'>        <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">=</span> <span class="n">ticks</span> <span class="o">+</span> <span class="n">delay</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast_delay_len</span> <span class="o">&gt;</span> <span class="n">ANYCAST_DELAY_MAX_LEN</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">TAILQ_INSERT_TAIL</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">anycast_delay_len</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">timer_running</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+</span><span class='line'>            <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="nl">freeit:</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span> <span class="n">__unused</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_anycast_delay</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">now</span> <span class="o">=</span> <span class="n">ticks</span><span class="p">;</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">TAILQ_FOREACH</span> <span class="p">(</span><span class="n">na_arg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">&lt;</span> <span class="n">now</span><span class="p">)</span> <span class="p">{</span>  <span class="cm">/* already expired. */</span>
+</span><span class='line'>            <span class="n">anycast_delay_len</span><span class="o">--</span><span class="p">;</span>
+</span><span class='line'>            <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>             <span class="p">...</span>
+</span><span class='line'>        <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delay</span> <span class="o">||</span> <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">-</span> <span class="n">now</span> <span class="o">&lt;</span> <span class="n">na_arg</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">delay</span> <span class="o">=</span> <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">-</span> <span class="n">now</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delay</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 还有NA需要send， 所以重启定时器 */</span>
+</span><span class='line'>        <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 没有NA了，所以NS里面可以启动定时器了 */</span>
+</span><span class='line'>        <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明:</p>
+
+<ol>
+<li>在na_struct_t结构里增加了一个expire成员，用来记录该NA包需要被发送的时刻。</li>
+<li>在timeout函数里，不是再去取TAILQ的first元素，而是去取所有expire时刻小于当前时刻的元素，即已经expire的NA，然后把它发送出去。同时找出下一个最近要发送的NA，找出它的expire时刻与当前时刻的差值，作为timer的下一个超时时间</li>
+<li>ticks是FreeBSD Kernel里头表示时间的一个全局变量，类似于Linux Kernel里的jiffies</li>
+</ol>
+
+
+<h2>Ref</h2>
+
+<ul>
+<li><a href="https://github.com/freebsd/freebsd">FreeBSD</a></li>
+<li><a href="http://www.ietf.org/rfc/rfc2461.txt">RFC-2461</a></li>
+<li><a href="https://github.com/torvalds/linux">Linux Kernel</a></li>
+<li>深入理解Linux网络技术内</li>
+<li>深入理解Linux内核</li>
+</ul>
+
+</div>
+
+
+<!--
+<div class="meta">
+	<div class="date">
+
+
+
+
+
+
+
+
+  
+
+
+<time datetime="2015-08-10T23:38:35+08:00" pubdate data-updated="true">Aug 10<span>th</span>, 2015</time></div>
+	
+	<div class="comments"><a href="#disqus_thread">Comments</a></div>
+	
+</div>
+--!>
+</article>
+
+	<div class="share">
+	<div class="addthis_toolbox addthis_default_style ">
+		
+		
+		
+		
+	</div>
+	
+</div>
+
+
+
+<section id="comment">
+    <h2 class="title">Comments</h2>
+    <div id="disqus_thread" aria-live="polite"><noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+</div>
+</section>
+</div>
+	<footer id="footer" class="inner">Copyright &copy; 2017
+
+    Yafang Shao
+
+</footer>
+	<script src="/javascripts/slash.js"></script>
+<script src="/javascripts/jquery.fancybox.pack.js"></script>
+<script type="text/javascript">
+(function($){
+	$('.fancybox').fancybox();
+})(jQuery);
+</script> <!-- Delete or comment this line to disable Fancybox -->
+
+
+<script type="text/javascript">
+      var disqus_shortname = 'laoar';
+      
+        
+        // var disqus_developer = 1;
+        var disqus_identifier = 'http://laoar.github.io/blog/2015/08/10/ndp/';
+        var disqus_url = 'http://laoar.github.io/blog/2015/08/10/ndp/';
+        var disqus_script = 'embed.js';
+      
+    (function () {
+      var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+      dsq.src = '//go.disqus.com/' + disqus_script;
+      (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    }());
+</script>
+
+
+
+
+
+</body>
+</html>

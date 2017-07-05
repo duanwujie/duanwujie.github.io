@@ -1,0 +1,3110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[One Man's Yammer]]></title>
+  <link href="http://laoar.github.io/atom.xml" rel="self"/>
+  <link href="http://laoar.github.io/"/>
+  <updated>2017-06-13T09:54:32+08:00</updated>
+  <id>http://laoar.github.io/</id>
+  <author>
+    <name><![CDATA[Yafang Shao]]></name>
+    <email><![CDATA[laoar.shao@gmail.com]]></email>
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[strace是如何工作的 ?]]></title>
+    <link href="http://laoar.github.io/blog/2017/06/12/strace/"/>
+    <updated>2017-06-12T22:06:41+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/06/12/strace</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<p>strace应该是我们经常使用的工具之一，他对于我们排除故障以及性能分析都很有帮助。   <br/>
+本文来分析一下strace的实现机制。   <br/>
+strace是用来跟踪系统的调用的，所以我们先来分析系统调用机制，然后再分析strace的实现机制。</p>
+
+<h2>关于系统调用(syscall)</h2>
+
+<p>系统调用的历史比较复杂，涉及到各种演变，以及glibc各版本与kenrel各版本的兼容性，以及AMD与intel的不统一。所以要理清syscall是是一件很庞杂的工程，也花费了我很长的时间。           <br/>
+syscall的主要原理大致如下图所示，glibc这块的代码就不深入探究了。</p>
+
+<p><img src="http://laoar.github.io/images/syscall.png"></p>
+
+<p>下面是对该图的一些解释。</p>
+
+<h4>context（上下文）</h4>
+
+<p>在userspace，只有进程运行，所以只有进程上下文（process context），对应于%usr；     <br/>
+在kernelspace，除了进程外，还存在着中断（包括硬件中断和软件中断），所以有进程上下文（对应于%sys）和中断上下文（interrupt context，包括%irq和%sirq）。</p>
+
+<p>在一开始的时候，linux是通过<code>int 80h</code>来实现的系统调用。<code>int 80h</code>会产生一个软中断给cpu，从而陷入内核，此时是中断上下文（对应于%sirq），在软中断里面会做一些当前用户态进程上下文的一些保存工作，比如寄存期的值等。在软中断里面将准备工作处理好后，就会让进程继续执行，于是进程进入到内核态，执行该系统调用对应的资源操作，此时就是处于进程上下文（对应于%sys）。</p>
+
+<p>这种方式存在的缺陷也是一目了然：首先这个过程需要去读取中断向量表，中断向量表可能不在cache中，cache miss的性能影响较明显；其次这个过程涉及到进程上下文到中断上下文的一系列保存／恢复操作，这些额外的指令占用了CPU时间。</p>
+
+<p>所以后来，intel／AMD这类CPU厂商就提出来了fast syscall的概念，增加一些新的指令编码让系统调用不用再经过中断上下文，让进程直接从用户态切换到内核态即可, 都是在进程上下文。即从trap方式变为MSR方式， 这些指令就是sysenter/sysexit/syscall.</p>
+
+<h4>context switch（上下文切换）</h4>
+
+<p>context switch，即我们用dstat或sar看到的<code>csw</code>.   <br/>
+需要注意的是，context switch只发生在当前运行进程（进程或线程一直是个容易混淆的概念，这里从用户程序视角而言用线程更清晰一些）的pid（对于线程而言，他在内核里也是一个pid）发生改变时。这可以从内核代码里的<code>__schedule</code>这个函数里看出来：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='cpp'><span class='line'><span class="n">__schedule</span>
+</span><span class='line'>    <span class="n">rq</span><span class="o">-&gt;</span><span class="n">nr_switches</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">context_switch</span><span class="p">(</span><span class="n">rq</span><span class="p">,</span> <span class="n">prev</span><span class="p">,</span> <span class="n">next</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以，从进程上下文进入中断上下文时并不存在context switch，因为当前的pid并没有发生改变。 只是从中断上下文再返回到进程上下文时是可以有context switch的，如果有更高优先级的进程需要运行的话，就会调度到这个更高优先级的进程去，当前运行进程的pid发生改变了，于是有了context switch。</p>
+
+<h4>用户态／内核态</h4>
+
+<p>用户态／内核态是进程在不同特权级的状态，用户态对应于ring3，内核态对应于ring0. （这是linux的实现，其他OS可能会有更加复杂的特权级设计）        <br/>
+对于资源的访问都是需要在内核态来实现的，这也是为什么进程在访问系统资源时需要通过syscall来进入内核态。如果要访问的资源只涉及到读取操作，不需要更改内核空间的数据，那么这个操作完全可以在用户态来执行，从而避免掉从用户态到内核态的切换，提升性能。于是就有了vDSO（virtual dynamic shared object）的概念。</p>
+
+<h4>vDSO</h4>
+
+<p>vDSO是把一些只读的并且会被频繁调用的系统调用实现从内核空间给映射到用户空间的一个页中，从而进程在执行这些系统调用时不用在进入到内核空间。   <br/>
+目前这类系统调用包括(参见kernel的arch/x86/vdso/这部分代码)：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='julia'><span class='line'><span class="n">gettimeofday</span>
+</span><span class='line'><span class="n">clock_gettime</span>
+</span><span class='line'><span class="n">getcpu</span>
+</span><span class='line'><span class="n">time</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>vDSO可以通过<code>/proc/[pid]/maps</code>来查看。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='julia'><span class='line'><span class="mi">7</span><span class="n">ffd659eb000</span><span class="o">-</span><span class="mi">7</span><span class="n">ffd659ed000</span> <span class="n">r</span><span class="o">-</span><span class="n">xp</span> <span class="mi">00000000</span> <span class="mi">00</span><span class="p">:</span><span class="mi">00</span> <span class="mi">0</span>                          <span class="p">[</span><span class="n">vdso</span><span class="p">]</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>syscall入口的统一化</h4>
+
+<p>早期的<code>int 80h</code>, 以及后来的<code>sysenter</code>/<code>sysexit</code>/<code>syscall</code>, 这么多的指令需要一个统一的封装，从而让用户程序不用关注一个系统调用具体会通过哪种方式进入内核态，这也是在vDSO里面来实现的。</p>
+
+<h2>接着来看strace</h2>
+
+<p>strace以attach的方式追踪一个进程的过程大致如下，tracee表示被追踪进程。    <br/>
+strace工具主要是用到了ptrace这个系统调用，ptrace这个系统调用提供了让一个进程观察和控制另外一个进程执行的方式，主要用在strace／gdb这类调试工具上。  <br/>
+使用ptrace你自己也能够实现一个简单的tracer。</p>
+
+<p><img src="http://laoar.github.io/images/strace.png"></p>
+
+<h4>父进程／子进程</h4>
+
+<p>一个进程在发生如下状态改变时会通知给他的父进程：进程终止(terminated),收到一个暂停执行的信号从而暂停执行，以及收到一个恢复执行的信号从而恢复执行。   <br/>
+那么父进程就可以通过wait/waitpid这类函数来捕获其子进程这些状态改变信息。</p>
+
+<p>所以如果一个进程想要追踪另外一个进程，首先就需要自己成为被追踪进程的父进程。 但是被追踪进程他本来是有自己的父进程的。所以Linux提供了这样一种方式来解决这个问题：让被追踪进程可以有两个父进程，一个真正的父进程，一个是tracer进程。这可以通过task_struct来查看：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='cpp'><span class='line'><span class="n">task_struct</span> <span class="p">{</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">task_struct</span> <span class="n">__rcu</span> <span class="o">*</span><span class="n">real_parent</span><span class="p">;</span> <span class="cm">/* real parent process */</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">task_struct</span> <span class="n">__rcu</span> <span class="o">*</span><span class="n">parent</span><span class="p">;</span> <span class="cm">/* recipient of SIGCHLD, wait4() reports */</span>
+</span><span class='line'><span class="p">};</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>于是attach到被调进程后，strace就成为了他的一个父进程。</p>
+
+<h4>进程状态</h4>
+
+<p>我们可以通过<code>ps aux</code>的<code>STAT</code>这一项来看进程的状态，会有R/S/D/T/Z/X这几个状态。  下面是对这些进程状态的一个粗略解释：</p>
+
+<ul>
+<li><p>R  <br/>
+TASK_RUNNING, 可执行状态，表示进程正在运行或者可以运行但是尚未被调度到的状态。</p></li>
+<li><p>S  <br/>
+TASK_INTERRUPTIBLE, 可以被信号打断的睡眠状态，系统里大部分进程都会处在这个状态。</p></li>
+<li><p>D  <br/>
+TASK_UNINTERRUPTIBLE, 不能够被信号打断的睡眠状态，在这个状态时是不可以被信号给wake up的，这也是该状态与S状态的区别，S状态是可以被信号给唤醒的。</p></li>
+<li><p>T<br/>
+TASK_STOPPED或者TASK_TRACED, 暂停状态或跟踪状态， 这两个状态都表示进程暂停下来。    <br/>
+TASK_TRACED就是strace跟踪涉及到的一个状态。在被追踪进程进入系统调用以及从系统调用返回时，他会发现自己被设置了PT_TRACED这个标记,于是就意识到自己被追踪了，于是就把自己的状态设置为TASK_TRACED，暂停下来执行，然后通知strace进程（通过SIGCHILD这个信号）；于是strace进程就做相应的信息处理，处理完后再resume被调进程的执行，将被调进程的状态设置为TASK_RUNNING，这也是我们在用strace跟踪进程时，会输出<code>resumed</code>的原因。</p></li>
+<li><p>Z  <br/>
+TASK_DEAD &ndash; EXIT_ZOMBIE, 僵死(zombie)进程, 即进程退出后他的进程结构体没有被父进程给回收。</p></li>
+<li><p>X <br/>
+TASK_DEAD &ndash; EXIT_DEAD, 退出状态，进程即将被销毁。</p></li>
+</ul>
+
+
+<h4>strace的性能影响</h4>
+
+<p>我们已经知道strace会导致被调进程在进入系统调用以及从系统调用返回时会有一个暂停状态，strace将信息处理完毕后再去恢复被调进程的执行。strace他本身只有一个线程，所以如果被调进程有非常多的子线程，而且系统调用又有些频繁，那么就可能导致strace进程忙不过来的情况：被调进程暂停了但是strace来不及去处理信息，这就会导致被调进程会暂停很长时间，对RT敏感的业务就会造成很大的影响。</p>
+
+<p>所以，线上业务一定要慎用strace，特别是系统繁忙的情况下。</p>
+
+<p>如果系统调用多大strace实在处理不过来时，他会放弃处理一些系统调用，从而避免把系统给搞跪了，即strace有一个单位时间内处理系统调用数目的阈值。</p>
+
+<p>strace程序为什么不做成多线程的呢？ 这样子不就可以处理更多的信息了么。也许这就是一个权衡吧，别让调试过多的影响程序执行。 (<code>TODO:</code> 有时间了我会研究下这个问题)</p>
+
+<h2>Ref.</h2>
+
+<p><a href="https://blog.packagecloud.io/eng/2016/02/29/how-does-strace-work/">How does strace work?</a>   <br/>
+<a href="https://blog.packagecloud.io/eng/2016/04/05/the-definitive-guide-to-linux-system-calls/">The Definitive Guide to Linux System Calls</a>   <br/>
+<a href="https://lwn.net/Articles/604515/">Anatomy of a system call, part 2</a>               <br/>
+<a href="https://www.intel.com/Assets/en_US/PDF/manual/253668.pdf">Intel® 64 and IA-32 Architectures Software Developer’s Manual Volume 3A: System Programming Guide, Part 1</a>
+<a href="https://webdocs.cs.ualberta.ca/~paullu/C498/meng.ptrace.slides.pdf">System Call Tracing using ptrace</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[擅用工具是最好的学习方式 ]]></title>
+    <link href="http://laoar.github.io/blog/2017/06/04/wireshark-comment/"/>
+    <updated>2017-06-04T11:30:49+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/06/04/wireshark-comment</id>
+    <content type="html"><![CDATA[<h2>RL;DR</h2>
+
+<p>这是对<a href="https://book.douban.com/subject/26710788/">wireshark网络分析的艺术</a>这本书的书评。 <br/>
+写于豆瓣，具体见<a href="https://book.douban.com/review/8580711/">擅用工具是最好的学习方式</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[为什么使能RPS/RFS, 或者RSS/网卡多队列后，QPS反而下降？]]></title>
+    <link href="http://laoar.github.io/blog/2017/05/07/rps/"/>
+    <updated>2017-05-07T17:36:21+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/05/07/rps</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<ul>
+<li><p>RPS  <br/>
+即receive side steering,利用网卡的多队列特性，将每个核分别跟网卡的一个首发队列绑定，以达到网卡硬中断和软中断均衡的负载在各个CPU上。  <br/>
+他要求网卡必须要支持多队列特性。</p></li>
+<li><p>RPS   <br/>
+receive packet steering  <br/>
+他把收到的packet依据一定的hash规则给hash到不同的CPU上去，以达到各个CPU负载均衡的目的。  <br/>
+他只是把软中断做负载均衡，不去改变硬中断。因而对网卡没有任何要求。</p></li>
+<li><p>RFS   <br/>
+receive flow steering  <br/>
+RFS需要依赖于RPS，他跟RPS不同的是不再简单的依据packet来做hash，而是根据flow的特性，即application在哪个核上来运行去做hash，从而使得有更好的数据局部性。</p></li>
+</ul>
+
+
+<p>我们可以看到很多案例，使用这些特性后提醒了网络包的处理能力，从而提升QPS，降低RT。</p>
+
+<p>但是，我们知道，任何一个优化特性都不是普遍适用的，都有他特定的场景来应用。   <br/>
+很多人对此可能会有疑惑，那很多优化功能不是都已经作为默认配置了么，如果不是普遍适用的，干嘛还要作为默认配置呢？ <br/>
+其实很简单，一个优化特性可以作为默认配置，依据我的理解，只需要满足下面这些特征即可：</p>
+
+<ul>
+<li>对某些场景可以显著提升性能</li>
+<li>对大部分场景无害</li>
+<li>对某一部分场景可能会损伤性能</li>
+</ul>
+
+
+<p>所以Linux的很多配置都是可以灵活配置供选择的。</p>
+
+<p>下面我们就来看下RPS这些特性在哪些场景下才能发挥作用。</p>
+
+<h2>问题描述</h2>
+
+<p>业务方在使用KVM虚拟机进行性能压测时，发现某一个核的softirq占比特别高，如下所示：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">mpstall</span><span class="x"> </span><span class="na">-L</span><span class="x"> </span><span class="kc">ALL</span><span class="x"> </span><span class="mi">1</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">20</span><span class="x"> </span><span class="nb">PM</span><span class="x">  </span><span class="nx">CPU</span><span class="x">    </span><span class="o">%</span><span class="nx">usr</span><span class="x">   </span><span class="o">%</span><span class="nx">nice</span><span class="x">    </span><span class="o">%</span><span class="nx">sys</span><span class="x"> </span><span class="o">%</span><span class="nx">iowait</span><span class="x">    </span><span class="o">%</span><span class="nx">irq</span><span class="x">   </span><span class="o">%</span><span class="nx">soft</span><span class="x">  </span><span class="o">%</span><span class="nb">steal</span><span class="x">  </span><span class="o">%</span><span class="nx">guest</span><span class="x">  </span><span class="o">%</span><span class="nx">gnice</span><span class="x">   </span><span class="o">%</span><span class="nx">idle</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">21</span><span class="x"> </span><span class="nb">PM</span><span class="x">  </span><span class="kc">all</span><span class="x">   </span><span class="mf">68.58</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">20.70</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.49</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.24</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">21</span><span class="x"> </span><span class="nb">PM</span><span class="x">    </span><span class="mi">0</span><span class="x">   </span><span class="mf">70.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">23.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">7.00</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">21</span><span class="x"> </span><span class="nb">PM</span><span class="x">    </span><span class="mi">1</span><span class="x">   </span><span class="mf">60.78</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">16.67</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">21.57</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.98</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">21</span><span class="x"> </span><span class="nb">PM</span><span class="x">    </span><span class="mi">2</span><span class="x">   </span><span class="mf">71.29</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">21.78</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">6.93</span><span class="x"></span>
+</span><span class='line'><span class="mi">03</span><span class="p">:</span><span class="mi">44</span><span class="p">:</span><span class="mi">21</span><span class="x"> </span><span class="nb">PM</span><span class="x">    </span><span class="mi">3</span><span class="x">   </span><span class="mf">73.74</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">21.21</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.05</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一句话解释：这个kvm虚拟机只有一个网卡，有网络包到达这个网卡后，它会给某一个cpu(如果没有设置亲和性，这个可以认为是随机的一个cpu，然后就会一直固定在这个cpu上)发中断，通知该cpu来处理这个包，然后cpu就会触发一个软中断把该包送到tcp/ip协议栈(对于tcp包而言)里去处理，该包被放入某一个socket的receive buffer中（如果是一个数据包），软中断结束。 <br/>
+%soft就是指的CPU耗在软中断处理上的时间。  <br/>
+可以看到核1的%soft很高，其他的核的%soft基本为0.    <br/>
+所以就想着把核1的%soft给均摊下，是否可以提升QPS。  <br/>
+我们想到的方法是网卡多队列，或者RPS／RFS。用这种手段来把网卡软中断给均摊到其他的核上去。</p>
+
+<p>其实，看到前面mpstat的显示，如果对网卡多队列，RPS／RFS很熟悉，就会意识到他们在这里不适用。  <br/>
+可惜理解的不深，交了这次学费。</p>
+
+<p>使能网卡多队列后，果然是QPS不但没有提升，反而有下降。   <br/>
+下面就是这次调优交的学费。</p>
+
+<p>为了使描述更清晰（其实是因为我做分析的这个kvm虚拟机上没有网卡多队列，但是不影响，导致性能下降的原因是一致的），我们只分析RPS来看下为什么性能会下降。</p>
+
+<h2>RPS的原理概述</h2>
+
+<ul>
+<li>基于CentOS-7</li>
+</ul>
+
+
+<p><img src="http://laoar.github.io/images/rps.png"></p>
+
+<p>在这之前，软中断只能在硬中断所在CPU上处理，使用RPS后，网卡软中断就可以分发到其他的CPU上去做处理了。</p>
+
+<h2>使能RPS后为什么会导致QPS下降？</h2>
+
+<p>如上图所示，使能了RPS后，会增加一些额外的CPU开销：</p>
+
+<ol>
+<li>收到网卡中断的CPU会向其他CPU发IPI中断，这体现在CPU的%irq上</li>
+<li>需要处理packet的cpu会收到NET_RX_SOFTIRQ软中断，这体现再CPU的%soft上。请注意，RPS并不会减少第一个CPU的软中断次数，但是会额外给其他的CPU增加软中断。他减少的是第一个CPU的软中断的执行时间，即，软中断里不再需要那么多的时间去走协议栈做包解析，把这个时间给均摊到其他的CPU上去了。</li>
+</ol>
+
+
+<h2>量化对比数据</h2>
+
+<h4>硬中断次数的变化</h4>
+
+<p>这可以通过/proc/interrupts来观察</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">watch</span><span class="x"> </span><span class="na">-d</span><span class="x"> </span><span class="na">-n</span><span class="x"> </span><span class="mi">1</span><span class="x"> </span><span class="s1">&#39;cat /proc/interrupts&#39;</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li><p>使能RPS之后：   <br/>
+<img src="http://laoar.github.io/images/rps-2.png"></p></li>
+<li><p>使能RPS之前：   <br/>
+<img src="http://laoar.github.io/images/rps-3.png"></p></li>
+</ul>
+
+
+<p>可以看到，是能RPS后，增加了很多的Function call interrups，即IPI。  <br/>
+而virtio0-input.0（虚拟网卡产生的中断，类似于图中NIC产生的中断）仍然只发给CPU1.  <br/>
+也可以通过dstat来看整体次数的对比</p>
+
+<ul>
+<li>使能RPS之后：</li>
+</ul>
+
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">dstat</span><span class="x"> </span>
+</span><span class='line'><span class="nx">You</span><span class="x"> </span><span class="nx">did</span><span class="x"> </span><span class="ow">not</span><span class="x"> </span><span class="k">select</span><span class="x"> </span><span class="nb">any</span><span class="x"> </span><span class="nx">stats</span><span class="p">,</span><span class="x"> </span><span class="nx">using</span><span class="x"> </span><span class="na">-cdngy</span><span class="x"> </span><span class="k">by</span><span class="x"> </span><span class="nx">default.</span><span class="x"></span>
+</span><span class='line'><span class="o">----</span><span class="nx">total</span><span class="na">-cpu-usage</span><span class="o">----</span><span class="x"> </span><span class="na">-dsk</span><span class="p">/</span><span class="nx">total</span><span class="o">-</span><span class="x"> </span><span class="na">-net</span><span class="p">/</span><span class="nx">total</span><span class="o">-</span><span class="x"> </span><span class="o">---</span><span class="nx">paging</span><span class="o">--</span><span class="x"> </span><span class="o">---</span><span class="nx">system</span><span class="o">--</span><span class="x"></span>
+</span><span class='line'><span class="nx">usr</span><span class="x"> </span><span class="nx">sys</span><span class="x"> </span><span class="nx">idl</span><span class="x"> </span><span class="nx">wai</span><span class="x"> </span><span class="nx">hiq</span><span class="x"> </span><span class="nx">siq</span><span class="o">|</span><span class="x"> </span><span class="nb">read</span><span class="x">  </span><span class="nx">writ</span><span class="o">|</span><span class="x"> </span><span class="nx">recv</span><span class="x">  </span><span class="nb">send</span><span class="o">|</span><span class="x">  </span><span class="k">in</span><span class="x">   </span><span class="nb">out</span><span class="x"> </span><span class="o">|</span><span class="x"> </span><span class="nx">int</span><span class="x">   </span><span class="nx">csw</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">62</span><span class="x">  </span><span class="mi">23</span><span class="x">   </span><span class="mi">4</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">  </span><span class="mi">12</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="mi">7096</span><span class="nx">k</span><span class="x">   </span><span class="mi">11</span><span class="nx">M</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">49</span><span class="nx">k</span><span class="x"> </span><span class="mi">2261</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">74</span><span class="x">  </span><span class="mi">13</span><span class="x">   </span><span class="mi">4</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">9</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="mi">4003</span><span class="nx">k</span><span class="x"> </span><span class="mi">6543</span><span class="nx">k</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">31</span><span class="nx">k</span><span class="x"> </span><span class="mi">2004</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">59</span><span class="x">  </span><span class="mi">22</span><span class="x">   </span><span class="mi">5</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">  </span><span class="mi">13</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">  </span><span class="mi">4096</span><span class="nx">B</span><span class="o">|</span><span class="mi">6710</span><span class="nx">k</span><span class="x">   </span><span class="mi">10</span><span class="nx">M</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">48</span><span class="nx">k</span><span class="x"> </span><span class="mi">2220</span><span class="x"> </span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>使能RPS之前：</li>
+</ul>
+
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">dstat</span><span class="x"> </span>
+</span><span class='line'><span class="nx">You</span><span class="x"> </span><span class="nx">did</span><span class="x"> </span><span class="ow">not</span><span class="x"> </span><span class="k">select</span><span class="x"> </span><span class="nb">any</span><span class="x"> </span><span class="nx">stats</span><span class="p">,</span><span class="x"> </span><span class="nx">using</span><span class="x"> </span><span class="na">-cdngy</span><span class="x"> </span><span class="k">by</span><span class="x"> </span><span class="nx">default.</span><span class="x"></span>
+</span><span class='line'><span class="o">----</span><span class="nx">total</span><span class="na">-cpu-usage</span><span class="o">----</span><span class="x"> </span><span class="na">-dsk</span><span class="p">/</span><span class="nx">total</span><span class="o">-</span><span class="x"> </span><span class="na">-net</span><span class="p">/</span><span class="nx">total</span><span class="o">-</span><span class="x"> </span><span class="o">---</span><span class="nx">paging</span><span class="o">--</span><span class="x"> </span><span class="o">---</span><span class="nx">system</span><span class="o">--</span><span class="x"></span>
+</span><span class='line'><span class="nx">usr</span><span class="x"> </span><span class="nx">sys</span><span class="x"> </span><span class="nx">idl</span><span class="x"> </span><span class="nx">wai</span><span class="x"> </span><span class="nx">hiq</span><span class="x"> </span><span class="nx">siq</span><span class="o">|</span><span class="x"> </span><span class="nb">read</span><span class="x">  </span><span class="nx">writ</span><span class="o">|</span><span class="x"> </span><span class="nx">recv</span><span class="x">  </span><span class="nb">send</span><span class="o">|</span><span class="x">  </span><span class="k">in</span><span class="x">   </span><span class="nb">out</span><span class="x"> </span><span class="o">|</span><span class="x"> </span><span class="nx">int</span><span class="x">   </span><span class="nx">csw</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">64</span><span class="x">  </span><span class="mi">23</span><span class="x">   </span><span class="mi">6</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">7</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">  </span><span class="mi">8192</span><span class="nx">B</span><span class="o">|</span><span class="mi">7917</span><span class="nx">k</span><span class="x">   </span><span class="mi">12</span><span class="nx">M</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">27</span><span class="nx">k</span><span class="x"> </span><span class="mi">1922</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">64</span><span class="x">  </span><span class="mi">22</span><span class="x">   </span><span class="mi">6</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">8</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="mi">7739</span><span class="nx">k</span><span class="x">   </span><span class="mi">12</span><span class="nx">M</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">26</span><span class="nx">k</span><span class="x"> </span><span class="mi">2210</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">61</span><span class="x">  </span><span class="mi">23</span><span class="x">   </span><span class="mi">9</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">7</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="mi">7397</span><span class="nx">k</span><span class="x">   </span><span class="mi">11</span><span class="nx">M</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="x">  </span><span class="mi">25</span><span class="nx">k</span><span class="x"> </span><span class="mi">2267</span><span class="x"> </span>
+</span><span class='line'><span class="x"> </span><span class="mi">94</span><span class="x">   </span><span class="mi">4</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">0</span><span class="x">   </span><span class="mi">1</span><span class="o">|</span><span class="x">   </span><span class="mi">0</span><span class="x">     </span><span class="mi">0</span><span class="x"> </span><span class="o">|</span><span class="mi">1262</span><span class="nx">k</span><span class="x"> </span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>软中断次数的变化</h4>
+
+<p>这可以通过/proc/softirq来观察</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">watch</span><span class="x"> </span><span class="na">-d</span><span class="x"> </span><span class="na">-n</span><span class="x"> </span><span class="mi">1</span><span class="x"> </span><span class="s1">&#39;cat /proc/softirq&#39;</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li><p>使能RPS之前：     <br/>
+<img src="http://laoar.github.io/images/rps-5.png"></p></li>
+<li><p>使能RPS之后：     <br/>
+<img src="http://laoar.github.io/images/rps-6.png"></p></li>
+</ul>
+
+
+<p>可以看到，CPU1上的RX_NET数相差不大比较接近，但是CPU0/2/3上各自都增加了NET_RX.</p>
+
+<h4>各个CPU利用率的变化</h4>
+
+<p>这可以通过mpstat来观察</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="err">$</span><span class="x"> </span><span class="nx">mpstat</span><span class="x"> </span><span class="na">-P</span><span class="x"> </span><span class="kc">ALL</span><span class="x"> </span><span class="mi">1</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>使能RPS之后</li>
+</ul>
+
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">     </span><span class="nx">CPU</span><span class="x">    </span><span class="o">%</span><span class="nx">usr</span><span class="x">   </span><span class="o">%</span><span class="nx">nice</span><span class="x">    </span><span class="o">%</span><span class="nx">sys</span><span class="x"> </span><span class="o">%</span><span class="nx">iowait</span><span class="x">    </span><span class="o">%</span><span class="nx">irq</span><span class="x">   </span><span class="o">%</span><span class="nx">soft</span><span class="x">  </span><span class="o">%</span><span class="nb">steal</span><span class="x">  </span><span class="o">%</span><span class="nx">guest</span><span class="x">  </span><span class="o">%</span><span class="nx">gnice</span><span class="x">   </span><span class="o">%</span><span class="nx">idle</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">     </span><span class="kc">all</span><span class="x">   </span><span class="mf">66.21</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">17.73</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">11.15</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">4.91</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">0</span><span class="x">   </span><span class="mf">68.17</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">18.33</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">7.67</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.83</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">1</span><span class="x">   </span><span class="mf">60.57</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">15.81</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">20.80</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">2.83</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">2</span><span class="x">   </span><span class="mf">69.95</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">19.20</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">7.01</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">3.84</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">3</span><span class="x">   </span><span class="mf">66.39</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">17.64</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">8.99</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">6.99</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p></p>
+
+<ul>
+<li>使能RPS之前</li>
+</ul>
+
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class='lasso'><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">     </span><span class="nx">CPU</span><span class="x">    </span><span class="o">%</span><span class="nx">usr</span><span class="x">   </span><span class="o">%</span><span class="nx">nice</span><span class="x">    </span><span class="o">%</span><span class="nx">sys</span><span class="x"> </span><span class="o">%</span><span class="nx">iowait</span><span class="x">    </span><span class="o">%</span><span class="nx">irq</span><span class="x">   </span><span class="o">%</span><span class="nx">soft</span><span class="x">  </span><span class="o">%</span><span class="nb">steal</span><span class="x">  </span><span class="o">%</span><span class="nx">guest</span><span class="x">  </span><span class="o">%</span><span class="nx">gnice</span><span class="x">   </span><span class="o">%</span><span class="nx">idle</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">     </span><span class="kc">all</span><span class="x">   </span><span class="mf">70.18</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">19.28</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.86</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">4.68</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">0</span><span class="x">   </span><span class="mf">73.25</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">21.50</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.25</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">1</span><span class="x">   </span><span class="mf">58.85</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">14.46</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">23.44</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">3.24</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">2</span><span class="x">   </span><span class="mf">74.50</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">20.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">5.50</span><span class="x"></span>
+</span><span class='line'><span class="k">Average</span><span class="p">:</span><span class="x">       </span><span class="mi">3</span><span class="x">   </span><span class="mf">74.25</span><span class="x">    </span><span class="mf">0.00</span><span class="x">   </span><span class="mf">21.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">0.00</span><span class="x">    </span><span class="mf">4.75</span><span class="x"></span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到，整体而言，CPU的%soft增大了很多，%usr下降了一些。   <br/>
+我们知道%usr是衡量用户态程序性能的一个指标，%usr越高，意味着执行业务代码的时间就越多。如果%usr下降，那就意味着执行业务代码的时间变少了，这显然对于业务性能是一个危险信号。  <br/>
+至于%usr里面如何来提高业务代码执行效率，是另外的问题了，不讨论。</p>
+
+<h2>结论，RPS适用的场景</h2>
+
+<p>使能了RPS后，会增加CPU的%soft，如果业务场景本身就是CPU密集的，CPU的负载已经很高了，那么RPS就会挤压%usr，即挤压业务代码的执行时间，从而导致业务性能下降。</p>
+
+<h4>适用场景</h4>
+
+<p>RPS如果想要提升业务性能，前提是除了网卡中断所在的CPU外，其他的CPU都需要有一定的空闲时间，这样使能RPS才能带来收益，否则就会带来额外开销导致性能下降。<br/>
+在这个场景下，RPS搭配RFS会带来更好的收益，不讨论。</p>
+
+<h2>有没有更优的解决方案？</h2>
+
+<p>答案肯定是有的。</p>
+
+<p>It is a SECRET!</p>
+
+<h2>Ref.</h2>
+
+<p><a href="https://lwn.net/Articles/362339/">RPS</a> <br/>
+<a href="https://lwn.net/Articles/382428/">RFS</a> <br/>
+<a href="https://www.kernel.org/doc/Documentation/networking/scaling.txt">RSS</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linus: Direct IO是个很脑残的设计]]></title>
+    <link href="http://laoar.github.io/blog/2017/04/28/directio/"/>
+    <updated>2017-04-28T22:21:25+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/04/28/directio</id>
+    <content type="html"><![CDATA[<h1>Linus: Direct IO是个很脑残的设计</h1>
+
+<h2>TL;DR</h2>
+
+<p>在Qcon演讲的时候提到了Direct IO，演讲完很多人对这个话题感兴趣，还有人特意通过他在场的同事加了我微信跟我讨论。  <br/>
+他们的观点是：</p>
+
+<ul>
+<li>Direct IO可以实现IO平滑控制</li>
+<li>非Direct IO消耗了大量内存，很多场景下尤其是视频领域，这些缓存的内存是个灾难，有限的内存还有更大的用处。</li>
+<li>跟我提到说阿里有个实现是，为了解决pagecache产生的突发时延，采用了DMA绕过pagecache的方式。</li>
+<li>application更清楚自己数据组织形式，所以自己来管理会更加的高效</li>
+<li>在一些场景下，application需要确认的是数据已经落盘，而不是写操作成功返回</li>
+</ul>
+
+
+<p>所以我把Linus很多年之前在邮件列表里的讨论给翻译了出来，供大家参考。     <br/>
+Linus究竟说的对不对，大家各自有自己的判断；Bypass kernel究竟好不好，每个人也都有自己的判断（特别是网络IO这块，不把kernel给bypass掉，你都不好意思说你是低延迟）；随着容器化／微服务化的潮流，微内核越来越流行，内核的一个趋势就是控制越来越少的资源，交给用户程序更好的自由度来管理资源。   <br/>
+我只是给大家翻译出来，让大家明白一个设计的初衷，以及一些基本的原理。</p>
+
+<p>因为整个篇幅较长，周日在家躺尸顺便翻译了一下很头大，就捡最重要的部分翻译了。  <br/>
+如果你的英文足够好，请直接阅读原文:  <a href="http://yarchive.net/comp/linux/o_direct.html">Discussion on O_DIRECT</a></p>
+
+<p>这些OS的设计者们在邮件列表里任性的讨论对于我们理解整个的底层机制是很有帮助的，甚至是我们反复去读代码都了解不到的。</p>
+
+<h2>乱翻译</h2>
+
+<p>路人甲对O_DIRECT做性能测试时发现，相比于非O_DIRECT的方式，它的性能下降了55%。 <br/>
+<font color=blue>[@yafang注： performance hit是很专业的一个词汇，在硅谷的科技公司中使用较多，意指性能损失，我们通常说的performance drop并不是很专业]</font></p>
+
+<p>于是路人甲就跑出了一个问题：</p>
+
+<ul>
+<li>路人甲：   <br/>
+在2.4.18的内核上，O_DIRECT仍然表现出来55%的性能下降，有人知道这是为什么吗 ？</li>
+</ul>
+
+
+<p>这个问题激起了很多的讨论，于是Linus冒出来了。</p>
+
+<ul>
+<li>Linus回应：  <br/>
+是的，因为O_DIRECT没有做任何预读取。  <br/>
+如果想让O_DIRECT产生效果,需要以异步的方式来使用它。</li>
+</ul>
+
+
+<p>然后路人乙跳出来质疑Linus，</p>
+
+<ul>
+<li>路人乙：  <br/>
+O_DIRECT对于那些维护自己缓存的应用特别有用，比如数据库。   <br/>
+在这个基础上再加上异步，会有更加明显的效果。     <br/>
+不需要预读取，也不用试着把它给缓存在内存中直到内存有压力时把它给踢出去。这对于处理随机IO是非常好的一个方式。</li>
+</ul>
+
+
+<p>瞬间这就激怒了Linus，</p>
+
+<ul>
+<li>Linus回应：<br/>
+O_DIRECT一直困扰我的事情是，它的整个接口非常的愚蠢，很可能是被磕了药的神经病猴子拍脑袋设计出来的。</li>
+</ul>
+
+
+<p>Linux的二号人物Alan Cox跳出来了，</p>
+
+<ul>
+<li>Alan Con插话：   <br/>
+O_DIRECT跟AIO一起用还是非常好的，没有aio的话它就有点欠缺了，此时readahead就有用了。</li>
+<li>Linus回应：  <br/>
+O_DIRECT之所以需要AIO，是为了掩盖它自己设计的本质性的愚蠢，如果这个接口设计的好的话，是不需要AIO的。</li>
+</ul>
+
+
+<p>然后Linus继续阐述自己详细的设计方案，他提出了下面一组新的系统调用：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class='cpp'><span class='line'><span class="o">-</span> <span class="n">readahead</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+</span><span class='line'><span class="err">它的作用很明显</span>
+</span><span class='line'><span class="p">[</span><span class="err">@</span><span class="n">yafang</span><span class="err">注：具体可以</span><span class="n">man</span> <span class="mi">2</span> <span class="n">readahead</span><span class="p">]</span>
+</span><span class='line'>
+</span><span class='line'><span class="o">-</span> <span class="n">mmap</span><span class="p">(</span><span class="n">MAP_UNCACHED</span><span class="p">)</span>
+</span><span class='line'><span class="err">这个接口只去设置</span><span class="n">vma</span><span class="err">的描述符（跟其他所有的</span><span class="n">mmap</span><span class="err">一样）。它跟一个常规的私有映射有点类似，区别是在读数据到内存时它不会去给页引用计数加一，而是去查看这个页是否可以直接从</span><span class="n">pagecache</span><span class="err">里给删除，然后再把以私用页的方式插入到映射里（即从</span><span class="n">pagecache</span><span class="err">里面偷一个页，只是修改页表就可以了）</span>
+</span><span class='line'><span class="p">[</span><span class="err">@</span><span class="n">yafang</span><span class="err">注：很遗憾，</span><span class="n">Linus</span><span class="err">的这个设想并没有实现</span><span class="p">]</span>
+</span><span class='line'>
+</span><span class='line'><span class="o">-</span> <span class="n">fdatasync_area</span><span class="p">(</span> <span class="n">fd</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">len</span><span class="p">)</span>
+</span><span class='line'><span class="p">[</span><span class="err">@</span><span class="n">yafang</span><span class="err">注：即</span><span class="n">msync</span><span class="p">]</span>
+</span><span class='line'>
+</span><span class='line'><span class="o">-</span> <span class="n">mwrite</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">addr</span><span class="p">,</span> <span class="n">len</span><span class="p">)</span>
+</span><span class='line'><span class="err">这个是</span><span class="n">mmap</span><span class="p">(</span><span class="n">MAP_UNCACHED</span><span class="p">)</span><span class="err">相反的实现，他会去遍历页表看这个映射是否已存在了，如果已经存在，就把它从页表里面删除；如果不存在，就会从后备存储设备里直接读取出来这个页从而避免污染页表。</span>
+</span><span class='line'><span class="err">然后再把这个</span><span class="n">page</span><span class="err">移动到</span><span class="n">pagecache</span><span class="err">里。</span>
+</span><span class='line'><span class="p">[</span><span class="err">@</span><span class="n">yafang</span><span class="err">注：很遗憾，</span><span class="n">Linus</span><span class="err">的这个设想也没有实现</span><span class="p">]</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>利用这组系统调用接口，就可以真正的实现从内核态到用户态的零拷贝，并且避免了缺页异常：</p>
+
+<ul>
+<li>为了实现零拷贝，mwrite需要去遍历页表（就跟O_DIRECT一样）</li>
+<li>如果用户空间不会去touch这个page，就不会去建立这个页表，也不会影响TLB    <br/>
+<font color=blue>[@yafang注：TLB是页表的缓存，在访问页表的时候会首先去访问TLB，如果TLB里面没有再去内存里面查找] </font></li>
+<li>mmap(MAP_UNCACHED)也不会去touch页表或者TLB</li>
+</ul>
+
+
+<p>总结起来就是，数据从pagecache到用户空间不会经历拷贝，它只是一次移动，通过修改这个page的页表来实现。</p>
+
+<p>路人丙跳出来问Linus对disk-based数据库怎么看。</p>
+
+<ul>
+<li><p>Linux回应： <br/>
+我希望in-memory database(内存数据库)能够完全替代disk-based数据库，这就解决了所有的IO问题。唯一需要被写入磁盘的是日志和备份数据，这两个都是线性的被写入到磁盘的，除非设计者是个疯子。   <br/>
+我不太懂db，但是如果有足够内存的话，再把数据写入到磁盘就很不合理了。</p></li>
+<li><p>路人丙说：
+我没有任何需要去更改O_DIRECT。如果你的app维护着自己的cache，那干嘛还需要内核的pagecache呢？</p></li>
+<li><p>Linus回应：   <br/>
+pagecache的设计目的是：</p>
+
+<ol>
+<li> 它是一个暂存区，以确保文件系统的块特性。让常规的读写操作不需要再去关心对齐。</li>
+<li> 一个同步的实体，确保读写互不干扰，这样子mmap的数据总是一致的。</li>
+<li> cache的作用，提高访问速度</li>
+</ol>
+
+
+<p>  O_DIRECT抛弃了第三点（即O_DIRECT也实现了前两点），但是这样子就破坏了其他部分。比如它破坏了磁盘的调度机制：设想一下读写磁盘的同一个区域。     <br/>
+你们这些人太过于关注“数据直达磁盘”了。</p></li>
+<li>路人丙继续质疑：  <br/>
+但是内存真的太贵了而且又小，不可能把整个数据库都放到内存里啊。如果你想买一个10TB内存的机器，那价格真是会上天了；而且，等到内存达到10TB的时候，数据库就会100TB了。</li>
+<li>Linux回应：  <br/>
+你看看这个趋势：大型机的市场在逐渐的微缩，所以如果小型机器占用了99%的市场份额的话会是件一点也不奇怪的事情。   <br/>
+Microsoft和Linux之所以能够干掉其他OS，就是因为它们的“小即时美”哲学。 <br/>
+我是在暗示说，数据量的大小是不可能赶得上内存大小的发展的。内存不仅仅可以不停的增长，而且应付数据量也会绰绰有余。
+<font color=blue>[@yafang注： Linus说对了么？ ]</font></li>
+</ul>
+
+
+<p>路人XYZ也趁机问Linux各种问题。</p>
+
+<ul>
+<li><p>关于mmap：   <br/>
+mmap最大的好处是你不用去关心你的访问方式，以及你的数据具有很好的局部性。   <br/>
+但是在其他场景下mmap就会带来一些弊端了，因为他会遍历页表，这代价就很高了，甚至比memcpy()还要高。</p></li>
+<li><p>关于memcpy：   <br/>
+memcpy()主要是因为名字起的太差了。memcpy是很慢，但是如果你拷贝的是最近在用的内存，实际上memcpy都是由cache来完成的。   <br/>
+而且拷贝通常意味着你不用去关心锁的问题以及同步的问题。   <br/>
+这也是为什么read()/write()常常比mmap()要快的原因。而且最好不要太大的buffer，因为buffer会影响到你的cache。  <br/>
+就现在而言，最快的拷贝文件的方式是做8KB每次的read/write，不用去担心系统调用的开销，确保L1 cache有足够的剩余空间来存储这8KB的数据，以及避免了mmap带来的page faults开销是更大的收益。</p></li>
+</ul>
+
+
+<p>路人丁提出了一些质疑：</p>
+
+<ul>
+<li>路人丁：   <br/>
+数据库管理自己的cache还有其他的原因，因为application比kernel更清楚自己的数据使用以及将来会怎么样用这些数据</li>
+<li>Linus回应：   <br/>
+你尽管告诉kernel你要怎么样用你的数据就好了</li>
+<li>路人丁：  <br/>
+更糟糕的是，没有办法来暗示正在做的这个IO是优先级非常低的IO。 这对于IO密集型的服务器而言，会有危害。</li>
+<li>Linus回应：  <br/>
+IO优先级是个非常无用的东西。 其他的进程能够得到更好的对待其实一点也不重要，真正的消耗在于seeking带来的延迟。 你真正需要的并不是IO优先级，而是IO batching。</li>
+</ul>
+
+
+<p>路人戊又问了一个问题：</p>
+
+<ul>
+<li>路人戊：    <br/>
+在mount文件系统的时候是否可以加上O_DIRECT这个标记 ？ 这样子我就不需要更改我的代码来实现O_DIRECT了</li>
+<li>Linus回应：   <br/>
+O_DIRECT存在的唯一原因是数据库人员太习惯于用它了，因为其他的OS并没有告诉他们有更好的实现方式，所以它们就直接的hack了它们的OS来按照自己的方式来。   <br/>
+O_DIRECT不仅仅是一个糟糕的设计，它还间接的破坏了接口的完整性。</li>
+</ul>
+
+
+<p>路人己提了一个问题：</p>
+
+<ul>
+<li>路人己：  <br/>
+madvise+mmap，可以实现从文件里面数据时的kernel／user零拷贝，并且不会污染cache。那么write呢？如果不使用O_DIRECT，怎么保证不污染cache呢？</li>
+<li>Linus回应：  <br/>
+mmap()+msync()可以实现。   <br/>
+而且，常规的用户态页对齐数据，也是可以很简单的移到page cache里面去（yafang注：即不是通过copy的方式）。 我们有很多基础设置可以实现这个功能，比如说splice()这个系统调用。 它被使用的不是很广泛。   <br/>
+<font color=blue>[@yafang注：我也不是很清楚splice，接下来会研究下] </font>    <br/>
+你们通常认为借助O_DIRECT只是bypass了OS的IO层，以及实现了直接写，这听起来很简单清晰。但是bypass kernel会对安全以及最基本的正确性会有一些细微的影响。   <br/>
+OS的本质是资源的管理器，让资源的使用合理并且不产生冲突。   <br/>
+O_DIRECT,通过bypass了真正的OS，从根本上破坏了OS设计的基本观点。</li>
+</ul>
+
+
+<h2>Ref.</h2>
+
+<p><a href="http://yarchive.net/comp/linux/o_direct.html">Discussion on O_DIRECT</a> <br/>
+<a href="https://lkml.org/lkml/2002/5/10/37">original mail</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Qcon北京2017参会总结]]></title>
+    <link href="http://laoar.github.io/blog/2017/04/28/comments-on-qcon/"/>
+    <updated>2017-04-28T21:15:19+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/04/28/comments-on-qcon</id>
+    <content type="html"><![CDATA[<h1>Qcon北京2017参会总结</h1>
+
+<h2>TL;DR</h2>
+
+<p>这是我在Qcon北京站听的一些分享。速记性质，给大家一个简略的索引，看看业界的某些趋势，各个演讲具体细节可去<a href="http://2017.qconbeijing.com/schedule">Qcon北京2017</a>, 有些有ppt，有些没有。</p>
+
+<h2>持续集成之Why, What and How</h2>
+
+<p>第一场演讲。   <br/>
+Jenkins的创始人过来布道，主要是说软件在一点点的统治世界，越来越重要，软件的版本更新／发布也越来越多，所以CI/CD很重要，然后就是Jenkins在CI／CD上做的多好，有多少牛逼企业都在用，大家赶紧用起来把。  <br/>
+实在话，Jenkins确实很好。</p>
+
+<h2>Maglev网络负载平衡系统</h2>
+
+<p>Google的Maglev作者过来演讲的。 <br/>
+事后跟他交流时，他说因为恰好小孩放春假（美国的一个假期），所以就带着小孩回老家重庆去看看，顺便来Qcon演讲下。  <br/>
+Google的技术都是自带光环的，确实也是有他光环的地方。   <br/>
+在易成演讲结束后，我跟做了一些深入的交流，收获挺多。  <br/>
+&ndash; 为什么不用lvs ?
+lvs是在内核态的，这样子灵活性就很差，更新一个功能得需要替换内核重启机器，google想在用户态实现四层负载均衡，这样子只需要重启应用就可以了。
+另外lvs的一致性问题也不满足google的要求。</p>
+
+<ul>
+<li><p>关于Maglev的kernel bypass：
+有一个专门的cpu去不停的poll网卡，看是否有包，然后分发给数据处理的cpu，主要也是解决网卡中断的问题。这跟很多kernel bypass模型也是一致的。
+如果数据包不是发往用户态程序的，会通过一个inteface重新注入内核，google一个专门的组来做这个interface。</p></li>
+<li><p>kernel bypass为什么不使用dpdk ?
+绑定在了特定网卡上 不想这个束缚 （@亚方 注：言外之意，我们google能力很强，看不上dpdk，我们搞得比他还要好）   <br/>
+dpdk也可以实现他们的功能</p></li>
+<li><p>关于用户态协议栈
+maglev是在四层做负载均衡，google有专门的组来去实现协议栈的功能。</p></li>
+<li><p>生产环境调试为什么不用tcpdump ?
+tcpdump是在内核里来实现的，如果使用它，就得把包重新注入内核，另外适应它比较消耗性能</p></li>
+<li><p>生产环境网络问题分析
+网络出了问题后就把调试信息拉去出来实时分析 这些调试信息记录在payload开始的地方以及在出问题时这个调试信息发往的IP 99.9%的包都不会用到这个payload，所以不会引入问题。
+这些调试信息不会去做存储做事后分析，google认为这样的意义不大。在环境不变的情况下，问题大部分都可以去复现的，如果不可以复现，就没有必要花精力去分析。</p></li>
+<li><p>关于一致性hash
+一致性hash主要解决的是集群中服务器增加/减少的问题。
+使用的一致性hash（maglev各个服务器间使用相同的hash算法，这样子tcp连接就会被hash到同样的GFE），以及网路跟踪表（一个五元组），来确保maglev中某个服务器挂掉或者GFE（对应lvs的rs）挂掉后已存在的tcp连接依然hash到相同的GFE上，确保连接不会重置。</p></li>
+<li><p>关于maglev后面的GFE（即lvs的rs）
+maglev会周期性的去探测后面的GFE，使用http/udp/ping都可以，来确保GFE能</p></li>
+<li><p>maglev会开源么 ？
+这个肯定不会，以后也不会。 <br/>
+因为maglev是跟google的整个代码耦合在一起的，并不是一个独立的模块，如果开源的话，google的所有代码都要开源了。</p></li>
+</ul>
+
+
+<h2>百度外卖从IDC到云端服务迁移过程</h2>
+
+<p>百度的一个运维总监。  <br/>
+女的。    <br/>
+2010年研究生毕业加入百度。</p>
+
+<p>她提到了一个网络监控可视化。  <br/>
+大致意思是，每个服务器上都有一个agent，然后nmap去扫描其他机器（nmap要比ping的效率高），然后把这些实时扫描信息放到redis中。再把这些数据做一个可视化，能够实时的去看内网中哪台交换机下面的哪台服务器出了故障。   <br/>
+另外她还提到了针对外网的健康监控系统。 <br/>
+大意是，有专门的server来专门去做外网的健康监控，根据当前商户／客户端IP来去做扫描，看看哪里的商户／客户端可能会存在问题。    <br/>
+这个外网健康监控系统是对APM的一个补充，它也只是部分场景下能够发挥作用。</p>
+
+<h2>阿里DevOps转型实践</h2>
+
+<p>比较能说，讲的也有点形而上。</p>
+
+<p>他提到的一些东西也是目前的一个趋势： 开发要具备运维能力，运维需要具备开发能力。</p>
+
+<p>还有就是自助化运维： <br/>
+在问题分析时对人的依赖转变为对工具的依赖，工具满足不了要求就反馈去改进这个工具，形成这样一个闭环。  <br/>
+自助化运维他比较推荐使用docker，因为docker固化了很多标准，提升了运维的力度。</p>
+
+<h2>云网分析与可视化——发掘网络数据的真正价值</h2>
+
+<p>偏技术，偏实战派。</p>
+
+<p>采集数据的方法也是在各个地方去加探针：从物理网络／逻辑网络／网络资源／应用这四个层面去加探针做采集。   <br/>
+然后就是对这些采集的数据做压缩聚合分析。 <br/>
+最后实现实时报警，发现毫秒级的毛刺。 <br/>
+看着很强悍。  <br/>
+来看下技术细节。  <br/>
+怎么样来采集虚拟网络的数据 ？ <br/>
+在每个物理机上会起一个专门的虚拟机，来把其他虚拟机的流量给镜像到这个虚拟机上去做分析。然后把这些流量做一些过滤／压缩之类的再把分析结果导出。 <br/>
+物理网络的采集也是用的流量镜像：会做一个过滤，有些流量不关心，有些流量只采集部分信息，有些流量采集全部信息。</p>
+
+<p>这些资源的消耗，对于我们，可能就是不能承受之重。</p>
+
+<h2>百度Matrix集群管理系统</h2>
+
+<p>个人感觉这个不错，技术上有难度，重要的是解决的很有价值的问题。</p>
+
+<p>百度做这个东西的背景是：他们机器的CPU利用率太低，需要去用技术手段来提升资源利用率。      <br/>
+（@亚方 事后补充：alibaba的一个首席科学家在下一天的主题分享上提到，twitter的平均CPU利用率是20%，google的平均CPU利用率是30%，这是前些年的数据，现在应该相差也不大）</p>
+
+<p>他提到的一个点是业务混布： 在线业务和离线业务混布在一起。  <br/>
+对于在线业务而言，我们知道，都是按照峰值来估计的，必须得预留足够的空间来预防突发张状况，所以在线业务天生就是CPU利用率低。      <br/>
+那么能不能在在线业务闲时把离线业务给布上去，在业务忙时再把这些离线业务杀掉／退掉／控制执行速率。 <br/>
+这就涉及到超发问题，这里面一个重要的逻辑就是合理调度，调度就涉及到任务的优先级。
+然后就需要对业务的优化级别去做一个区分：
+&ndash; 在任何情况下都得保证运行的业务 <br/>
+&ndash; 能够正常运行的业务 <br/>
+&ndash; 有资源就运行没资源可以不运行的业务</p>
+
+<p>前两种任务本质上是单机上的调度：是否可抢占。   <br/>
+最后一种则是集群级别的调度：集群内是否还有quota可用。</p>
+
+<p>在资源不够时对任务的杀／退／控制速率这个逻辑是在单机里面来实现的，目的是为了确保他能够及时快速的生效，以避免影响线上业务。</p>
+
+<p>关于quota，这也是他们很重要的一个概念。  <br/>
+百度现在在业务需要部署时不再以机器为维度来申请，而是以资源为维度， 即分配给它多少quota。</p>
+
+<p>matrix在虚拟化过程中，用的是自研的container，本质也是对cgroup／namespace的封装，他的container支持docker image。</p>
+
+<p>百度有很多不同的集群，openstack集群啊等等，如何把这些集群的离线资源打通来统一调度也是一个难题。</p>
+
+<h2>京东： 人工智能驱动零售</h2>
+
+<p>PPT做的不错，视频做的不错。演讲的较差。</p>
+
+<p>给人描述了人工智能在零售业务上的应用场景。
+比如智慧物流，比如客户知识图谱。</p>
+
+<p>建议大家都看下这个ppt。</p>
+
+<h2>应用开发的未来</h2>
+
+<p>Oracle VP的演讲。  <br/>
+标题是中文的，演讲是英文的。</p>
+
+<p>他这里面主要提的一个概念是FaaS(function as a service).</p>
+
+<p>之所以产生这个概念，是因为现在的微服务／容器化还是存在一些问题：  <br/>
+微服务和容器都还是以机器为粒度的，这些服务首先是要去部署到一个机器上去，部署的服务就可能会导致网络问题，进而导致所在机器下线，进而影响到这个机器上的其他服务。</p>
+
+<p>所以就有了serverless(无服务器化)这个概念：  <br/>
+&ndash; 把function（函数）作为部署和扩展的基本单位
+&ndash; 开发模型里再也看不到server，vm，container这些东西  <br/>
+&ndash; 等等</p>
+
+<p>大致意思是说，我们的业务模型再也不用去关注资源，只关注具体的函数实现即可，你想要完成什么功能会有一个eventhub（事件中心）给你做分发。也就是把资源再给做一层抽象，你不再直接给资源打交道，而是跟这个抽象层直接打交道。         <br/>
+举一个比较浅显的例子：     <br/>
+比如你的模块想要获取别的服务器上的一些数据，你肯定不会通过IP来去获取，应该是要通过域名或者主机名之类的。这种方式就是把IP这个资源给做了一层抽象，你不再关注具体的IP资源。    <br/>
+serverless也是类似的概念。</p>
+
+<p>VP说，未来一定会是微服务以及FaaS相结合的天下。    <br/>
+那么在微服务以及FaaS的这个趋势下，什么会越来越重要？  <br/>
+VP给的答案是Docker + Java最适合微服务以及FaaS，所以你们都赶紧去好好学java。       <br/>
+至于是不是这样子，还是说Oracle在吹捧自己的java，每个人就见仁见智了。</p>
+
+<p>另外再说一句， *aaS这个东西似乎层出不穷，前几天看到华为实时操作系统部门的一个分享，提到了一个LaaS，latency as service. 延迟怎么成了服务了，不清楚细节。 华为的内部资料也没有share给外面。</p>
+
+<p>[yafang注：阿里云最近实现的函数计算，就是一种FaaS]</p>
+
+<h2>新时代下工程师的发展和选择</h2>
+
+<p>顶天的演讲     <br/>
+我就不做解读了</p>
+
+<h2>Software Performance Analytics: Past, Present and Future</h2>
+
+<p>alibaba首席科学家的演讲。  <br/>
+这个人一毕业就工作于intel，在intel一工作就是20年，然后2016年加入了alibaba。      <br/>
+他主要专注于如何让软硬件更合的结合，以让Java程序充分利用计算机硬件的性能。</p>
+
+<p>他的演讲非常偏理论。     <br/>
+一些很朴素的理论，也是我们很容易忽略的理论。  <br/>
+他举的案例，非常简单的一个案例，吧啦吧啦的还说了半天。其实就是想说，对于单机的性能优化而言，其本质，万变不离其宗，无非就是去掉某一个功能或者调整功能的系数，让CPU专注在重要的事情上面。   <br/>
+至于具体的优化方法，相信每一个稍微有点经验的人都能吧啦吧啦说半天，重要的是这些优化方法本质上到底是在做什么。    <br/>
+他演讲里面提到一些papar感觉还不错。</p>
+
+<h2>性能优化面面观</h2>
+
+<p>听了腾讯视频，以及facebook instagram的优化。    <br/>
+优化方法没有什么特别值得说的地方，这也是性能优化的一个特征，单机上的性能优化方法也就那些，没有什么新鲜的，关键是如何去找到在哪里做优化。 即profile才是最重要的，要有强悍的profile tools。   <br/>
+facebook的profile工具给大家参考下：</p>
+
+<ul>
+<li>dynostats</li>
+<li>cprofile  （因为他们的主要开发语言是python）</li>
+<li>instalab</li>
+</ul>
+
+
+<p>值得说的是，他们在性能压测是，是以cpu cycles为主要指标，而不是cpu times。   <br/>
+dynostats会去采集CPI以及其他一些信息，cprofile则是函数维度的分析，instalab是流量回放分析。如何在采集信息时对业务性能影响小，这里面需要很精细的设计，他们对cprofile也做了大量的改进，还未开源，有开源的计划。</p>
+
+<h2>高可用实践：从淘宝到上云的差异</h2>
+
+<p>淘宝的人过来讲的，感觉跟我们的做法比较一致。</p>
+
+<p>高可用性关键的部分也是限流（对上限流，对下限流），开关（出问题时的快速恢复），弹性（无状态服务的容器化，来实现水平扩展）。</p>
+
+<h2>新浪微博混合云架构应用实践之路</h2>
+
+<p>新浪微博的业务有一个比较明显的特征： 在有热点事件是，流量会暴增，然后持续短时间就又降下来，这些热点事件往往很突发不可预测。     <br/>
+所以，如何在有热点事件时来快速的扩容就很关键。</p>
+
+<p>新浪微博在2014年开始docker化，15年开始部署混合云（基于openstack的私有云+阿里云组成的混合云），借助阿里云来实现快速的弹性扩容。</p>
+
+<ul>
+<li><p>容器的调度为什么用openstack ？  <br/>
+新浪微博在一开始的时候用的swarm，并且对swarm做了很多的改造，但是随着规模的扩大，swarm暴漏了一些缺陷，所以就开始转用了openstack。之所以用openstack主要是因为他对网络支持的较好，比如跟OVS的天然结合。同时新浪自研了自己的容器编排工具。</p></li>
+<li><p>容器调度为什么不考虑k8s ？
+k8s在小规模上比较有优势，新浪微博的规模较大，k8s不适用，而且k8s对网络的支持也不是很好。</p></li>
+<li><p>关于容器的资源评估   <br/>
+现有的容器调度框架，比如k8s，openstack，他们都没有去考虑容器的资源利用率问题。google的borg是个例外，他在调度时会比较看重容器的资源利用率。  <br/>
+新浪微博也在自研自己的容器资源评估框架，这里面最重要是去建立一个合适的指标体系。</p></li>
+<li><p>关于容器的配置管理    <br/>
+适用ansible（新浪微博做了一些优化）来做配置管理，一个重要原因是它跟阿里云天然结合。</p></li>
+</ul>
+
+
+<p>新浪微博的混合云管理平台opendcp已经开源在github上:<a href="https://github.com/weibocom/opendcp">opendcp</a>。</p>
+
+<p>新浪微博现在在做缓存的服务化，具体细节不清楚。</p>
+
+<h2>超大规模性能测试的云端解决方案及案例分享</h2>
+
+<p>说个小插曲。  <br/>
+在第一天的讲师欢迎晚宴上，正在吃着饭，旁边一个人凑过来说，“你是哪个公司的，加一下微信吧”，聊了下他的公司是Xmeter的。那个人相貌平平（借用一下古天乐的此人相貌平平），没有去深入交流，只是加了下微信，简单聊了几句。当时我还想着Xmeter又是哪一个美国公司。</p>
+
+<p>Qcon最后一场，也有点疲惫，感觉也没啥好听的，就来听了这场。  <br/>
+然后演讲者上台说“我是Xmeter的&hellip;”, 忽然想到前几天好像遇到过一个Xmeter的人，然后仔细看发现不就是那个人么！竟然还是创始人。</p>
+
+<p>他主要的做法是对Jmeter做改造，因为Jmeter是典型的master-slave模型，不能水平扩展。所以需要做一些改造，将master／slave之间的控制流和数据流做分离，同时master／slave之间的控制流加一个消息中间件，从而实现了水平扩展。消息中间件是通过rabbitmq，使用zookeeper来服务发现；数据流是典型的流式处理：storm+kafka。</p>
+
+<p>一个人从头到尾将这个东西搞出来还是挺不容易的。
+技术创业的可能性，也许这个人明天就把公司给IPO了呢。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[My talk at Qcon Bejing 2017]]></title>
+    <link href="http://laoar.github.io/blog/2017/04/23/qcon2017/"/>
+    <updated>2017-04-23T12:38:44+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/04/23/qcon2017</id>
+    <content type="html"><![CDATA[<p><a href="http://2017.qconbeijing.com/presentation/820">从 Linux 系统内核层面来解决实际问题的实战经验</a>  <br/>
+这是我在Qcon北京2017所作的演讲，官网可下载PPT。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[A sad story]]></title>
+    <link href="http://laoar.github.io/blog/2017/03/26/continue/"/>
+    <updated>2017-03-26T21:17:11+08:00</updated>
+    <id>http://laoar.github.io/blog/2017/03/26/continue</id>
+    <content type="html"><![CDATA[<h2>背景</h2>
+
+<p>前几天我的gmail邮箱收到一封邮件：   <br/>
+“你的域名即将到期，请你及时续费”</p>
+
+<p>然后我才意识到我的博客已经很久没有更新了&hellip;</p>
+
+<p>然后还发现我的博客排版真是惨不忍睹&hellip;</p>
+
+<h2>接下来</h2>
+
+<ul>
+<li>整理下排版</li>
+<li>更新下博客  <br/>
+记录下最近技术方面的一些收获</li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Brendan Gregg: 一个实战派大神]]></title>
+    <link href="http://laoar.github.io/blog/2016/05/14/comments-on-breg/"/>
+    <updated>2016-05-14T13:16:53+08:00</updated>
+    <id>http://laoar.github.io/blog/2016/05/14/comments-on-breg</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<p>这是我对<a href="https://book.douban.com/subject/24840375/">Systems Performance</a> (中文名：性能之巅)这本书的评论，<br/>
+原文在豆瓣: <a href="https://book.douban.com/review/7894012/">Brendan Gregg: 一个实战派大神</a></p>
+
+<p>在写完这篇评论不久，我发现了这本书里面存在一些错误之处，本来想跟Brendan发封邮件让他出个errata的，一拖再拖
+就懒得弄了。 好在这些错误没有什么本质的影响，瑕不掩瑜。</p>
+
+<h2>Ref.</h2>
+
+<ul>
+<li>关于Brendan Gregg：  <br/>
+<a href="http://www.brendangregg.com">Brendan D. Gregg</a></li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux内核分析： OOM杀掉nginx后导致的系统hang问题]]></title>
+    <link href="http://laoar.github.io/blog/2016/03/02/nginx/"/>
+    <updated>2016-03-02T21:44:26+08:00</updated>
+    <id>http://laoar.github.io/blog/2016/03/02/nginx</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<p>同样是发表在mogu.io的博客.   <br/>
+好吧，我写东西喜欢加个前缀，比如这两篇里的“Linux内核分析：XXX”&hellip;</p>
+
+<p>同样google了下，也被引用很多：  <br/>
+<img src="http://laoar.github.io/images/nginx.png"></p>
+
+<p>如有兴趣，请移步<a href="http://top.caibaojian.com/82296">码农头条</a>阅读</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux内核分析：页回收导致的cpu load瞬间飙高的问题分析与思考]]></title>
+    <link href="http://laoar.github.io/blog/2016/02/29/highload/"/>
+    <updated>2016-02-29T21:21:04+08:00</updated>
+    <id>http://laoar.github.io/blog/2016/02/29/highload</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<p>这是我发表在蘑菇街技术博客(mogu.io)上面的一篇文章。  <br/>
+本来想直接把链接copy过来的，结果发现mogu.io打不开了竟然&hellip;</p>
+
+<p>我就google了下看，看看哪里还能找到，结果，发现了被很多引用：  <br/>
+<img src="http://laoar.github.io/images/highload.png"></p>
+
+<p>等等，混入了一些奇怪的东西，请看最后一个： <br/>
+<img src="http://laoar.github.io/images/highload_2.png"></p>
+
+<p>竟然被人抄袭为了毕业论文，OMG，顿时感觉自己像个作家似了呢&hellip;</p>
+
+<p>如对这篇文章感兴趣，可以移步<a href="http://www.blogs8.cn/posts/A4qd667">blog8</a>去阅读.</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[性能优化：来龙及去脉]]></title>
+    <link href="http://laoar.github.io/blog/2015/12/05/performance-tuning/"/>
+    <updated>2015-12-05T22:13:55+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/12/05/performance-tuning</id>
+    <content type="html"><![CDATA[<h3>背景</h3>
+
+<p>这是我在离开Juniper之前应manager及同事们的要求，给他们做的一个培训。
+因为我是结合Juniper具体产品来写的材料，所以这里就删去了Juniper的关键信息。</p>
+
+<h3>什么是性能优化</h3>
+
+<ul>
+<li><p>性能优化是一个理论体系，然而终究是要去解决实际问题.</p>
+
+<ul>
+<li>所以，有效的才是最好的!</li>
+</ul>
+</li>
+<li><p>要去解决实际问题，终归还是得有理论基础</p>
+
+<ul>
+<li>Profiling Tools</li>
+<li>可执行文件
+
+<ul>
+<li>文件格式</li>
+<li>编译基础：gcc</li>
+<li>加载执行</li>
+</ul>
+</li>
+<li>CPU体系结构
+
+<ul>
+<li>CPU performance counter registers</li>
+<li>Cache</li>
+</ul>
+</li>
+<li>内存管理
+
+<ul>
+<li>Kernel：  Page</li>
+<li>多线程： 共享内存</li>
+<li>Glibc：  堆内存管理算法</li>
+</ul>
+</li>
+<li>剩下的，都是编程语言的事了</li>
+</ul>
+</li>
+</ul>
+
+
+<h3>Profiling Tools</h3>
+
+<ul>
+<li>开发者在写代码时就意识到了这个函数对性能影响较大
+
+<ul>
+<li>所以我们自己在这些函数的入口和出口分别获取一些统计计数，就可以计算出这个函数的执行开销。</li>
+<li>这样的缺点也是显而易见，用这种方法只能看这些特定的函数</li>
+</ul>
+</li>
+<li>我们还想看其他函数的开销怎么办？
+
+<ul>
+<li>第一种策略是受限于编译时，所以只能看特定的函数，那是不是可以在运行时再去决定要profile的函数？</li>
+<li>于是就有了另外一种profiling策略：首先这个函数必须得是全局符号就，然后根据这个全局符号来找到它的地址，接着把这个地址里的指令替换为我们自己的指令跳转到统计函数里，统计完后再返回原来的函数继续去执行</li>
+<li>这样做显然也是有局限性的，那就是只能profile全局符号</li>
+</ul>
+</li>
+<li>那编译时可不可以做到来profile所有的函数？
+
+<ul>
+<li>答案是有的。比如gprof这个工具，它在编译时会对所有全局函数的入口和出口处做统计。</li>
+</ul>
+</li>
+</ul>
+
+
+<h3>关于profiling tools的一些思考</h3>
+
+<ul>
+<li>要不要把profiling tool编译进最终的可执行文件？
+
+<ul>
+<li>如果要是编译进去，显然会影响性能</li>
+<li>如果不。那么那么实际上这是两个不同的可执行文件，所以结果并不能真实的反应实际结果</li>
+</ul>
+</li>
+<li>可不可以退而求其次，把它给编译进去，但是我们通过一个开关来控制它，默认关闭。
+
+<ul>
+<li>看起来，这相对于不编译进去，在运行时只是多了一个if的判断指令，一条判断语句也费不了多少时间。</li>
+<li>然而，这些代码被编译为二进制后还是要占用地址空间的，从而会影响到指令预取。</li>
+<li>那么，我们使用unlikely把这部分代码给放在编译到函数的最后面不就可以不影响指令预取了么？是的，但是它只是不影响这个函数内的指令预取，从全局来看，指令预取还是会受到影响。</li>
+</ul>
+</li>
+<li>结论：鱼与熊掌不可兼得，要么要性能要么要准确性</li>
+</ul>
+
+
+<h3>涉及到的可执行文件的一些知识</h3>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Docker背后的技术： Namespaces]]></title>
+    <link href="http://laoar.github.io/blog/2015/09/04/namespace/"/>
+    <updated>2015-09-04T23:04:21+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/09/04/namespace</id>
+    <content type="html"><![CDATA[<h2>背景知识：一句话概括Docker</h2>
+
+<p>Docker是基于Linux container的一个容器管理工具。它的作用是将应用程序给容器化，以保证在同一个Kernel上运行的应用程序的运行环境相互隔离，让容器内的这些进程觉得在这个系统里只有这些进程而感知不到其他进程的存在。与Docker容易进行比较的一种技术是KVM，KVM的作用是虚拟化，它实现一些硬件的虚拟化，这样来在一个VM里运行其他的Kernel。Docker的优点是可以快速的创建线程，并且以native的速度快速执行，高效的使用系统资源。</p>
+
+<h4>Docker的概貌如下图</h4>
+
+<center><img src="http://laoar.github.io/images/namespace-docker.png"> </center>
+
+
+<p>Docker的原生内核是Linux，如果要在非Linux（Windows/Mac OS）上运行Docker还是得需要有VM。</p>
+
+<h2>Docker用到的内核技术</h2>
+
+<p>在Linux Kernel里对资源进行控制的机制是cgroup，实现资源隔离的机制是namespaces， cgroup和namespaces就是Linux container用到的两个内核机制。</p>
+
+<h2>Namespaces背景知识：进程地址空间</h2>
+
+<p>下图是32-bit Linux典型的地址空间分布:</p>
+
+<center><img src="http://laoar.github.io/images/namespace-space.png"></center>
+
+
+<p>如图所示，在User Space(0~3G)各个进程拥有自己独立的地址空间，它们互相看不到对方。这些进程通过Kernel API(syscall/ioctl/socket/trap&hellip;)进入Kenrel Space(3G~4G)，然后使用内核提供的服务，所有的进程共享同一个Kenrel Space。</p>
+
+<p>这样带来的结果就是，虽然在User Space所有的进程都有独立的地址空间，互相看不到对方，然而在Kernel Space，他们是感知到其他进程存在的。</p>
+
+<p>如何让进程在使用内核服务时感知不到其他无关进程的存在，就产生了namespaces这个技术。</p>
+
+<h2>Namespaces：抽象，封装，多实例</h2>
+
+<p>在内核里面有很多全局变量，比如init进程(1号进程)，比如根目录(/)，比如时钟，比如路由表，这些全局变量就是内核提供的一些全局资源。实现进程的隔离，首先要解决的就是这些全局资源问题，让各个容器内的进程都有自己独立的全局资源，即全局资源的多实例化，每个容器内都有这些全局资源的一个实例。具体到编程角度，就是将这些全局变量给封装。
+比如对于根目录(/)的如下封装: (摘自Kernel-3.9)</p>
+
+<center><img src="http://laoar.github.io/images/namespace-mnt.png"> </center>
+
+
+<p>mnt_namespace是mount namespaces的抽象数据结构。mount namespaces是内核里已经实现的namespaces中的一个，它的作用是隔离挂载点(mount point), 这样一个mount namespaces里的这组进程只能看到自己的目录结构，并且把它的挂载点当作根目录，从而看不到它的挂载点之外的目录结构。这有些类似于chroot(2)这个系统调用，mount namespaces比chroot好的地方在于，chroot只是将子目录设置为应用程序的根目录(/), 在chroot的根目录下不会有系统根目录下的其他子目录，而mount namespaces则会这些子目录的一个实例。  <br/>
+来看下docker的具体示例。</p>
+
+<p>下图是在Host OS(我的Macbook的OS)里的目录结构：</p>
+
+<center><img src="http://laoar.github.io/images/namespace-host.png"></center>
+
+
+<p>然后我们在docker machine里启动一个ubuntu container，看下这个container的目录结构：</p>
+
+<center><img src="http://laoar.github.io/images/namespace-container.png"></center>
+
+
+<p> 可以看到这是一个新的目录结构。其中hostname那一项是该container的ID。
+为了实现mount namespaces，mount()以及umount()这两个系统调用都要做出相应的改变。他们不再操作对所有进程均可见的全局挂载点，取而代之的是只影响跟该mount space相关的进程。</p>
+
+<h2>Namespaces的过去，现状及未来</h2>
+
+<p>Mount namespaces是Linux Kernel里最先出现的一个namespace，它是为了解决clone()系统调用而增加的，由于当时想不到还会有其他的namespace，所以就给mount namespaces起了一个比较通用的名字，叫做CLONE_NEWNS，即new namespace的意思。那个时候更不要说会预见到有container这种东西了。
+伴随着container这个概念的产生，增加了更多的namespaces来满足需要。</p>
+
+<ul>
+<li>Network namespaces: 用来实现网络资源(网络设备，IP地址，IP路由表，端口号，等等)的隔离。</li>
+<li>PID namespaces: 用来实现PID号这个资源的隔离，这样在不同的PID namespaces中可以使用同一个PID，比如每个namespace都有它自己的init进程(PID 1)，init进程是所有其他进程的祖先进程。</li>
+<li>IPC namespaces: 用来隔离System V IPC标识以及Posix消息队列, 这样就使得不同Namespace之间的进程不能直接通信，就像是在不同的系统里一样</li>
+<li>UTS namespaces: 用来封装uname()这个系统调用。可以虚拟出一个有独立主机名.</li>
+<li>User namespaces: 用来隔离用户ID和组ID。那么这样就可以让一个用户在某个container里拥有root权限但是在整个系统里却没有root权限。</li>
+</ul>
+
+
+<p>我前面提到的这6个namespaces就是目前最新Linux Kernel(Kernel-4.2)里所有已实现的namespaces。由于Linux Kernel里拥有非常多的全局资源，随着越来越多应用场景的出现，每一个全局变量都有可能被封装进namespace，这就不可避免在将来会产生新的namespace，比如甚至系统时间都可能会被封装进namespace这样不同的container就会有不同的时间。由此伴随而来的一个问题就是，如何来组织这些namespaces来避免namespace种类的大爆炸以及系统复杂性的增加，这会是一个挑战。</p>
+
+<h2>Linux的Namespaces，FreeBSD的Jails</h2>
+
+<p>在FreeBSD上面，与Namespaces类似的机制叫做Jails。Jals具有如下一些功能：</p>
+
+<ul>
+<li>目录树  <br/>
+实现效果和Linux的Mount namespaces类似。</li>
+<li>主机名  <br/>
+每个jail可以有自己的主机名。这类似于Linux的UTS namespaces。</li>
+<li>IP地址  <br/>
+分配给jail的IP地址，一个jail的IP地址通常是系统里存在的网络接口的IP地址。这类似于Linux的Network namespaces。</li>
+<li>命令  <br/>
+jail内部的执行路径PATH，这个路径是相对于该jail环境的根目录的。</li>
+</ul>
+
+
+<p>jail有自己独立的用户组和root用户，并且这些用户都限制在这个jail的内部。这类似于Linux的User namespaces。</p>
+
+<p>所以FreeBSD的Jails和Linux的Namespaces具有类似的功能，都是为了系统虚拟化。因而Docker移植到FreeBSD上面也是有可能的。</p>
+
+<h2>Ref</h2>
+
+<ul>
+<li><a href="https://docs.docker.com">Docker Docs</a></li>
+<li><a href="https://lwn.net/Articles/531114">LWN:Namespaces in operation</a></li>
+<li><a href="https://www.freebsd.org/doc/handbook/jails.html">FreeBSD Jails</a></li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[FreeBSD里的callwheel机制(补充前一篇)]]></title>
+    <link href="http://laoar.github.io/blog/2015/08/17/callwheel/"/>
+    <updated>2015-08-17T22:04:09+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/08/17/callwheel</id>
+    <content type="html"><![CDATA[<p>FreeBSD里的定时器是基于一种callwheel机制，因为前一篇用到了timer，所以这里就简单介绍一下其基本原理。之所以单独成一篇，是由于前一篇篇幅太长了。</p>
+
+<h2>timer</h2>
+
+<p>来看下timer start的时候做了什么事, 在FreeBSD里timer是借助于callout API来实现的。callout是FreeBSD提供的一个kernel interface，它可以让一个函数在未来被调用。</p>
+
+<p>在FreeBSD里面和时间有关的一些应用都会用到callout, 它在系统里面的一些应用如下：</p>
+
+<center><img src="http://laoar.github.io/images/callwhell-callout.jpg"></center>
+
+
+<p>对于callout的具体细节不在此讨论，只说一下和定时器有关的关键部分。</p>
+
+<p>timer start函数如下所示：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">timer_start</span> <span class="p">(</span><span class="k">struct</span>  <span class="n">callout</span> <span class="o">*</span><span class="n">c</span><span class="p">,</span> <span class="p">...)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>   <span class="c1">// 首先计算出超时时刻</span>
+</span><span class='line'>     <span class="n">expire</span> <span class="o">=</span> <span class="n">ticks</span> <span class="o">+</span> <span class="n">delay_ticks</span><span class="p">;</span>
+</span><span class='line'>   <span class="c1">// 将该callout结构体添加到callwheel里面对应的TAILQ中</span>
+</span><span class='line'>   <span class="c1">// callwheelmask是(callwheelsize - 1), 它由callout数目来决定</span>
+</span><span class='line'>     <span class="n">TAILQ_INSERT_TAIL</span><span class="p">(</span><span class="o">&amp;</span><span class="n">callwheel</span><span class="p">[</span><span class="n">expire</span> <span class="o">&amp;</span> <span class="n">callwheelmask</span><span class="p">],</span> <span class="n">c</span><span class="p">,</span> <span class="p">...);</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到，该callout是通过一种hash算法(expire &amp; callwheelmask)来被添加到对应的TAILQ里面。callwheelsize是一个实验值，如果值太小的话显然会导致hash冲突比较多；而如果太大也不行，它会预先分配很多内存。所以FreeBSD Kernel Guys就采用了一个实验值，即假定一个进程（注意，在kernel里，进程和线程是没有区别的）以及一个打开的文件描述符都可以有一个callout。所以callout的最大值ncallout就被设置为了:</p>
+
+<center>ncallout = 16 + maxproc + maxfiles; </center>
+
+
+<p>callwheelsize是不大于ncallout的最大的2的幂值，比如如果ncallout是2076，那么callwheelsize就是2048。</p>
+
+<p>callout是借助于时钟中断来实现的。</p>
+
+<h2>hardclock</h2>
+
+<p>首先要明白一个概念，什么是时钟中断上半部(hardclock)与时钟中断下半部(softclock).中断的上半部是不可以被打断的，它通常用来处理比较紧急且耗时短的任务；中断的下半部则是可以被打断的，它可以用来处理那些比较耗时的任务。比如timer，它就是在时钟中断的下半部处理的，即softclock里面。</p>
+
+<p>以下代码皆摘自FreeBSD Kernel。FreeBSD Kernel时钟这部分的代码相对比较稳定，基本没有太大变化。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/*</span>
+</span><span class='line'><span class="cm">* The real-time timer, interrupting hz times per second.</span>
+</span><span class='line'><span class="cm">*/</span>
+</span><span class='line'><span class="c1">// 时钟中断入口函数。1秒会有hz个中断。在BSD里面，hz默认配置的是1000或者100.</span>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">hardclock</span><span class="p">(</span><span class="n">frame</span><span class="p">)</span>
+</span><span class='line'>   <span class="c1">// 每来一次中断， ticks增加1.</span>
+</span><span class='line'>     <span class="n">ticks</span><span class="o">++</span><span class="p">;.</span>
+</span><span class='line'>   <span class="c1">// 如果当前ticks对应的callwheel链表不为空，就说明有timer需要处理.</span>
+</span><span class='line'>     <span class="k">if</span> <span class="p">(</span><span class="n">TAILQ_FIRST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">callwheel</span><span class="p">[</span><span class="n">ticks</span> <span class="o">&amp;</span> <span class="n">callwheelmask</span><span class="p">])</span> <span class="o">!=</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>          <span class="n">need_softclock</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+</span><span class='line'>          <span class="c1">// 否则（所有的timer都处理完了），就&gt;让softticks跟ticks保持一致.（softticks是一直小于等于ticks的）</span>
+</span><span class='line'>     <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">softticks</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">==</span> <span class="n">ticks</span><span class="p">)</span>
+</span><span class='line'>          <span class="o">++</span><span class="n">softticks</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'>     <span class="c1">// 如果需要时钟软中断，就在这里启动。 </span>
+</span><span class='line'>     <span class="k">if</span> <span class="p">(</span><span class="n">need_softclock</span><span class="p">)</span>
+</span><span class='line'>        <span class="n">swi_sched</span><span class="p">(</span><span class="n">softclock_ih</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Nota bene. 往右拉可以看到全部的注释文字。</p>
+
+<h2>softclock</h2>
+
+<p>软时钟中断的入口函数是softclock</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/*</span>
+</span><span class='line'><span class="cm">* Software (low priority) clock interrupt.</span>
+</span><span class='line'><span class="cm">* Run periodic events from timeout queue.</span>
+</span><span class='line'><span class="cm">*/</span>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="nf">softclock</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">dummy</span><span class="p">)</span>
+</span><span class='line'>   <span class="c1">// softticks一直小于等于ticks   </span>
+</span><span class='line'>     <span class="k">while</span> <span class="p">(</span><span class="n">softticks</span> <span class="o">!=</span> <span class="n">ticks</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="c1">// 来记录时钟软中断数    </span>
+</span><span class='line'>          <span class="n">softticks</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>           <span class="cm">/*</span>
+</span><span class='line'><span class="cm">            * softticks may be modified by hard clock, so cache</span>
+</span><span class='line'><span class="cm">            * it while we work on a given bucket.</span>
+</span><span class='line'><span class="cm">            */</span>
+</span><span class='line'>          <span class="n">curticks</span> <span class="o">=</span> <span class="n">softticks</span><span class="p">;</span>
+</span><span class='line'>        <span class="c1">// 取出当前softticks&gt;对应的timer链表</span>
+</span><span class='line'>          <span class="n">bucket</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">callwheel</span><span class="p">[</span><span class="n">curticks</span> <span class="o">&amp;</span> <span class="n">callwheelmask</span><span class="p">];</span>
+</span><span class='line'>          <span class="n">c</span> <span class="o">=</span> <span class="n">TAILQ_FIRST</span><span class="p">(</span><span class="n">bucket</span><span class="p">);</span>
+</span><span class='line'>          <span class="k">while</span> <span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>               <span class="k">if</span> <span class="p">(</span><span class="n">c</span><span class="o">-&gt;</span><span class="n">c_time</span> <span class="o">!=</span> <span class="n">curticks</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>                  <span class="c1">// 保持该元素在链表里，持续的检查这个链表.</span>
+</span><span class='line'>                    <span class="n">c</span> <span class="o">=</span> <span class="n">TAILQ_NEXT</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">c_links</span><span class="p">.</span><span class="n">tqe</span><span class="p">);</span>
+</span><span class='line'>                    <span class="o">++</span><span class="n">steps</span><span class="p">;</span>
+</span><span class='line'>                    <span class="k">if</span> <span class="p">(</span><span class="n">steps</span> <span class="o">&gt;=</span> <span class="n">MAX_SOFTCLOCK_STEPS</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>                         <span class="n">nextsoftcheck</span> <span class="o">=</span> <span class="n">c</span><span class="p">;</span>
+</span><span class='line'>                         <span class="p">;</span>
+</span><span class='line'>                         <span class="n">c</span> <span class="o">=</span> <span class="n">nextsoftcheck</span><span class="p">;</span>
+</span><span class='line'>                         <span class="n">steps</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>                    <span class="p">}</span>
+</span><span class='line'>               <span class="c1">// 这个timer expire了  </span>
+</span><span class='line'>               <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class='line'>                  <span class="c1">// 取下一个要判断的timer</span>
+</span><span class='line'>                    <span class="n">nextsoftcheck</span> <span class="o">=</span> <span class="n">TAILQ_NEXT</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">c_links</span><span class="p">.</span><span class="n">tqe</span><span class="p">);</span>
+</span><span class='line'>                    <span class="n">TAILQ_REMOVE</span><span class="p">(</span><span class="n">bucket</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">c_links</span><span class="p">.</span><span class="n">tqe</span><span class="p">);</span>
+</span><span class='line'>                  <span class="c1">// 执行相应的函数</span>
+</span><span class='line'>                    <span class="n">c_func</span><span class="p">(</span><span class="n">c_arg</span><span class="p">);</span>
+</span><span class='line'>                    <span class="n">c</span> <span class="o">=</span> <span class="n">nextsoftcheck</span><span class="p">;</span>
+</span><span class='line'>               <span class="p">}</span>
+</span><span class='line'>          <span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一张图来描述callwheel结构体，就是这个样子的：</p>
+
+<center><img src="http://laoar.github.io/images/callwheel-struct.jpg"> </center>
+
+
+<h2>ref</h2>
+
+<ul>
+<li><a href="http://people.freebsd.org/~davide/asia/callout_paper.pdf">callout paper</a></li>
+<li><a href="http://lists.freebsd.org/pipermail/freebsd-arch/2013-January/013807.html">discussion on callout</a></li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[RFC-2461 IPv6 NDP中NA延时的一个实现方案：异步/多实例/实时性]]></title>
+    <link href="http://laoar.github.io/blog/2015/08/10/ndp/"/>
+    <updated>2015-08-10T23:38:35+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/08/10/ndp</id>
+    <content type="html"><![CDATA[<h2>背景</h2>
+
+<p>最近为了实现NDP(Neighbor Discovery Protocol)里头proxy延迟的问题，去看了一下RFC-2461，以及思考了下如果要实现Multiple instance NDP应该怎么做扩展。</p>
+
+<h2>知识介绍</h2>
+
+<p>在最新的<a href="https://github.com/freebsd/freebsd">iFreeBSD(FeeBSD 11.X)</a>代码里依然没有实现<a href="http://www.ietf.org/rfc/rfc2461.txt">RFC-2461</a>中规定的对于anycast或者proxy类型的NS包在回NA的时候需要一个小于1S的随机时间的延时:  <br/>
+&ldquo;If the Target Address is an anycast address the sender SHOULD delay
+sending a response for a random time between 0 and  MAX_ANYCAST_DELAY_TIME seconds.&rdquo;  <br/>
+  其中，MAX_ANYCAST_DELAY_TIME为1 second.   <br/>
+大致意思就是说，对于接受到的每一个NS包，需要回一个NA给对端。对于anycast或者proxy这种类型的包，再回NA的时候需要一个时间延迟，该延时时一个小于1S的随机时间。</p>
+
+<p>引入延迟的主要原因是为了使代理的邻居项的优先级比其他授权的主机（例如，实际拥有Solicited L3地址的主机）的低。延迟时间是一个随机数的原因是，随机数的使用可以降低多个主机同时发出请求，并导致拥塞的可能。</p>
+
+<p>FreeBSD的代码具体参见下面这个函数：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'>  <span class="cm">/*</span>
+</span><span class='line'><span class="cm">   * Neighbor advertisement input handling.</span>
+</span><span class='line'><span class="cm">   *</span>
+</span><span class='line'><span class="cm">   * Based on RFC 2461</span>
+</span><span class='line'><span class="cm">   * Based on RFC 2462 (duplicate address detection)</span>
+</span><span class='line'><span class="cm">   *</span>
+</span><span class='line'><span class="cm">   * the following items are not implemented yet:</span>
+</span><span class='line'><span class="cm">   * - proxy advertisement delay rule (RFC2461 7.2.8, last paragraph, SHOULD)</span>
+</span><span class='line'><span class="cm">   * - anycast advertisement delay rule (RFC2461 7.2.7, SHOULD)</span>
+</span><span class='line'><span class="cm">   */</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span> <span class="nf">nd6_na_input</span><span class="p">(</span><span class="k">struct</span> <span class="n">mbuf</span> <span class="o">*</span><span class="n">m</span><span class="p">,</span> <span class="kt">int</span> <span class="n">off</span><span class="p">,</span> <span class="kt">int</span> <span class="n">icmp6len</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在Kernel里头对于延时的一个做法是借助一个timer机制：即我们启动一个定时器，给定时器设置一个超时时间，然后在定时器超时后去执行相应的操作。我们对这个场景做一些简化，只需要如下三个timer的API：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/* 初始化一个timer */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_init</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="cm">/* 启动timer，ticks是timer多长时间超时，超时后去执行func这个函数，arg是传递给func的参数 */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_start</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">,</span> <span class="kt">int</span> <span class="n">ticks</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">func</span><span class="p">,</span> <span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="cm">/* 强制终止一个timer，用在处理异常情况 */</span>
+</span><span class='line'><span class="kt">void</span> <span class="nf">timer_stop</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">t</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>一个简单的实现</h2>
+
+<p>然后我们假设NA要执行的函数是anycast_delay_handler, 用到的参数na_arg,.    <br/>
+那么我们可以做如下一个大致实现:</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">anycast_delay_timer</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">timer</span> <span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">timer</span><span class="p">));</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">timer</span> <span class="o">=</span> <span class="n">anycast_delay_timer</span><span class="p">;</span> <span class="cm">/* need free it in the async function */</span>
+</span><span class='line'>        <span class="n">jtimer_init</span><span class="p">(</span><span class="n">anycast_delay_timer</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">jtimer_start</span><span class="p">(</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="nl">freeit:</span>
+</span><span class='line'>    <span class="err">…</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="p">(</span><span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="p">;</span>
+</span><span class='line'>     <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="n">free</span><span class="p">(</span><span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">timer</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明：</p>
+
+<ol>
+<li>anycast_delay_handler 是一个异步函数，即启动timer的函数nd6_na_input()不用等待该函数执行就直接返回，这也是timer的一种做法。 如果是同步函数，那就得等待该函数执行完毕后，nd6_na_input()再返回。</li>
+<li>由于anycast_delay_handler是异步函数，所以这个local timer就不能分配在栈空间，必须分配在堆空间，然后在timer超时后再在anycast_delay_handler里面free掉该timer。</li>
+<li>但是这种做法不太scalable，它的扩展性比较差。比如我们要想强制stop该timer就不是很好处理。通常我们都是把timer来定义为一个全局变量，而不是局部变量，然后让timer分时对处理各个任务。我们可以看到在Linux Kerrnel里头，NDP/ARP都是有一个全局的neighbor table，比如ndp_tbl, arp_tbl，也就是每个协议在内核协议栈里面都是单实例的，所以对于NDP我们最好只使用一个timer，而不是每个packet都创建一个timer。</li>
+<li>HZ这个值是可以配置的，用来表示时钟中断的频率，即1S有HZ个时钟中断。在Kernel里面一般默认为100或者1000. 这里(randome() % HZ)表示最大1S的时间。</li>
+</ol>
+
+
+<h2>可扩展性考虑</h2>
+
+<p>所以，为了scalable考虑，我们还是得将该timer定义为一个全局的timer。  <br/>
+static struct timer anycast_delay_timer; /<em> 定义为一个static变量 </em>/    <br/>
+由于timeout handler跟start timer的函数是异步的，一旦定义为全局timer后，就要面临一个异步问题：在一个新的NS包到来后前一个NS包的NA的timer可能还没有超时，那么这个新的NA包去start这个timer就会出现问题。所以我们必须把需要发送的NS包都给添加到一个链表里面，然后该timer去这个链表里面去取。
+这可以借助FreeBSD的TAILQ机制来实现。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">struct</span> <span class="n">na_struct_t</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="cm">/* 放到一个TAILQ里头 */</span>
+</span><span class='line'>    <span class="n">TAILQ_ENTRY</span><span class="p">(</span><span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_delay_list</span><span class="p">;</span>
+</span><span class='line'><span class="p">};</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">TAILQ_HEAD</span><span class="p">(</span><span class="n">anycast_list_</span><span class="p">,</span> <span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_list</span> <span class="o">=</span> <span class="n">TAILQ_HEAD_INITIALIZER</span><span class="p">(</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">static</span> <span class="k">struct</span> <span class="n">timer</span> <span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'><span class="k">static</span> <span class="n">boolean</span> <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'><span class="cm">/* the max members in the anycast_delay_list */</span>
+</span><span class='line'><span class="cp">#define ANYCAST_DELAY_MAX_LEN 64</span>
+</span><span class='line'><span class="cm">/* anycast/proxy delay list length */</span>
+</span><span class='line'><span class="kt">int</span> <span class="n">anycast_delay_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">na_struct_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="n">set_na</span><span class="p">(...);</span>
+</span><span class='line'>        <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast_delay_len</span> <span class="o">&gt;</span> <span class="n">ANYCAST_DELAY_MAX_LEN</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">TAILQ_INSERT_TAIL</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">anycast_delay_len</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">timer_running</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+</span><span class='line'>            <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="cm">/* once this function is executed, the tail should not be empty */</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_t</span> <span class="o">*</span><span class="n">na</span> <span class="o">=</span> <span class="n">TAILQ_FIRST</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">TAILQ_REMOVE</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">anycast_delay_len</span><span class="o">--</span><span class="p">;</span>
+</span><span class='line'>    <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">TAILQ_EMPTY</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">))</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="cm">/* 还有NA需要send， 所以重启定时器 */</span>
+</span><span class='line'>        <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 没有NA了，所以NS里面可以启动定时器了 */</span>
+</span><span class='line'>        <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明：</p>
+
+<ol>
+<li>在timeout函数的尾部判断是否需要重启定时器，这样来一个一个的处理TAILQ里面的元素</li>
+<li>这个TAILQ是一个全局的链表，所以需要考虑到并行问题，在对这个链表操作时需要加锁。 这个锁的粒度有些大，可以更改的更加小粒度一些，比如只要锁住插入/删除位置即可。定时器超时函数是在软中断中执行的，它不是进程上下文，所以不能执行休眠和调度。所以在timeout函数里面访问共享数据的时候，不能使用mutex来加锁，要使用spinlock来加锁。(mutex会睡眠，spinlock则是一直忙等)</li>
+<li>在往这个链表里面添加元素时，得确保这个链表不会很长，否则就导致占用太多资源，而且NA也不能及时的发送出去。所以我们得为这个链表设置一个最大长度，比如64. 如果超出这个值，就直接简单的丢弃掉这个包，这个网络处理的机制是一致的，网络太繁忙处理不过来，所以直接丢弃</li>
+</ol>
+
+
+<p>由于将所有的NA包都添加到了一个链表中来处理，那么就有可能导致链表很长，然后链表尾部的元素就可能花费N*delay(N为链表里面总的元素数)，这个时间就可能会远大于1s，这就跟RFC的标准不一致。所以得重新思考一个算法，使得确保这个时间小于1S。另外，由于FreeBSD/Linux是非实时的系统，所以还得考虑到这个时间误差。</p>
+
+<h2>基于时间的考虑</h2>
+
+<p>所谓实时操作系统是指，如果一个任务需要执行，它会立即得到执行，而不会有时间延迟。对于Linux/FreeBSD这类系统而言，任务的执行都是依赖于时钟中断引起的调度，各个任务会有自己的优先级，在调度的时候会根据优先级来选择某一个任务得到执行，而且任务必须得等到时钟中断到来才可能得到执行机会，这就导致Linux/FreeBSD是非实时的。 考虑到这个因素，anycast/proxy的delay时间最好设置为一个小于1S的随机时间，比如最大为1s * (8 / 10)。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/* the max members in the anycast_delay_list */</span>
+</span><span class='line'><span class="cp">#define ANYCAST_DELAY_MAX_LEN 64</span>
+</span><span class='line'><span class="cm">/* anycast/proxy delay list length */</span>
+</span><span class='line'><span class="kt">int</span> <span class="n">anycast_delay_len</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">struct</span> <span class="n">na_struct_t</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">expire</span><span class="p">;</span> <span class="cm">/*这个包需要延时发送的时刻 */</span>
+</span><span class='line'>    <span class="n">TAILQ_ENTRY</span><span class="p">(</span><span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_delay_list</span><span class="p">;</span> <span class="cm">/* 放到一个TAILQ里头 */</span>
+</span><span class='line'><span class="p">};</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">TAILQ_HEAD</span><span class="p">(</span><span class="n">anycast_list_</span><span class="p">,</span> <span class="n">na_struct_t</span><span class="p">)</span> <span class="n">anycast_list</span> <span class="o">=</span> <span class="n">TAILQ_HEAD_INITIALIZER</span><span class="p">(</span><span class="n">anycast_list</span><span class="p">);</span>
+</span><span class='line'>
+</span><span class='line'><span class="k">static</span> <span class="k">struct</span> <span class="n">timer</span> <span class="n">anycast_delay_timer</span><span class="p">;</span>
+</span><span class='line'><span class="k">static</span> <span class="n">boolean</span> <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">nd6_na_input</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="n">anycast</span> <span class="o">||</span> <span class="n">proxy</span> <span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="n">random</span><span class="p">()</span> <span class="o">%</span> <span class="n">HZ</span><span class="p">;</span>
+</span><span class='line'>        <span class="k">struct</span> <span class="n">na_struct_t</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="n">set_na</span><span class="p">(...);</span>
+</span><span class='line'>        <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">=</span> <span class="n">ticks</span> <span class="o">+</span> <span class="n">delay</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">anycast_delay_len</span> <span class="o">&gt;</span> <span class="n">ANYCAST_DELAY_MAX_LEN</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="k">goto</span> <span class="n">freeit</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>        <span class="n">TAILQ_INSERT_TAIL</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">na_arg</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">);</span>
+</span><span class='line'>        <span class="n">anycast_delay_len</span><span class="o">++</span><span class="p">;</span>
+</span><span class='line'>        <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">timer_running</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+</span><span class='line'>            <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'>        <span class="k">return</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="nl">freeit:</span>
+</span><span class='line'>    <span class="p">...</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span>
+</span><span class='line'><span class="n">anycast_delay_handler</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">arg</span> <span class="n">__unused</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="k">struct</span> <span class="n">na_arg_anycast_delay</span> <span class="o">*</span><span class="n">na_arg</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">now</span> <span class="o">=</span> <span class="n">ticks</span><span class="p">;</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">delay</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">spin_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">TAILQ_FOREACH</span> <span class="p">(</span><span class="n">na_arg</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">anycast_list</span><span class="p">,</span> <span class="n">anycast_delay_list</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="k">if</span> <span class="p">(</span><span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">&lt;</span> <span class="n">now</span><span class="p">)</span> <span class="p">{</span>  <span class="cm">/* already expired. */</span>
+</span><span class='line'>            <span class="n">anycast_delay_len</span><span class="o">--</span><span class="p">;</span>
+</span><span class='line'>            <span class="cm">/*send out the NA packet*/</span>
+</span><span class='line'>             <span class="p">...</span>
+</span><span class='line'>        <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delay</span> <span class="o">||</span> <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">-</span> <span class="n">now</span> <span class="o">&lt;</span> <span class="n">na_arg</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>            <span class="n">delay</span> <span class="o">=</span> <span class="n">na_arg</span><span class="o">-&gt;</span><span class="n">expire</span> <span class="o">-</span> <span class="n">now</span><span class="p">;</span>
+</span><span class='line'>        <span class="p">}</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">delay</span><span class="p">)</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 还有NA需要send， 所以重启定时器 */</span>
+</span><span class='line'>        <span class="n">timer_start</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_delay_timer</span><span class="p">,</span> <span class="n">delay</span><span class="p">,</span> <span class="n">anycast_delay_handler</span><span class="p">,</span> <span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="mi">0</span><span class="p">);</span>
+</span><span class='line'>    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class='line'>        <span class="cm">/* 没有NA了，所以NS里面可以启动定时器了 */</span>
+</span><span class='line'>        <span class="n">timer_running</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+</span><span class='line'>    <span class="p">}</span>
+</span><span class='line'>    <span class="n">spin_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">anycast_list_lock</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些说明:</p>
+
+<ol>
+<li>在na_struct_t结构里增加了一个expire成员，用来记录该NA包需要被发送的时刻。</li>
+<li>在timeout函数里，不是再去取TAILQ的first元素，而是去取所有expire时刻小于当前时刻的元素，即已经expire的NA，然后把它发送出去。同时找出下一个最近要发送的NA，找出它的expire时刻与当前时刻的差值，作为timer的下一个超时时间</li>
+<li>ticks是FreeBSD Kernel里头表示时间的一个全局变量，类似于Linux Kernel里的jiffies</li>
+</ol>
+
+
+<h2>Ref</h2>
+
+<ul>
+<li><a href="https://github.com/freebsd/freebsd">FreeBSD</a></li>
+<li><a href="http://www.ietf.org/rfc/rfc2461.txt">RFC-2461</a></li>
+<li><a href="https://github.com/torvalds/linux">Linux Kernel</a></li>
+<li>深入理解Linux网络技术内</li>
+<li>深入理解Linux内核</li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[lock-free、网络吞吐量性能、并发及其他]]></title>
+    <link href="http://laoar.github.io/blog/2015/06/14/lock-free/"/>
+    <updated>2015-06-14T21:57:38+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/06/14/lock-free</id>
+    <content type="html"><![CDATA[<p>前段时间尝试更改我们系统里的并发实现，用lockfree来实现了一遍以提升网络吞吐量。在这个过程中遇到了一些很有趣的技术细节，在这里记录一下。  <br/>
+公司业务不便多说，我就借助dpdk的packet processing模型来说明一下。下图摘自dpdk.org。</p>
+
+<center> <img src="http://laoar.github.io/images/lockfree-dpdk.jpg"> </center>
+
+
+<p>如上图所示，是一个典型的packet processing模型，RX这个线程接受到数据包后送给distributor，然后Worker Lcore这些线程从Distributor那里获取数据包来处理。和本次讨论无关的技术不在此阐述，我将其简化为更加清晰明了的下图。</p>
+
+<center> <img src="http://laoar.github.io/images/lockfree-ring.jpg"> </center>
+
+
+<p>我们的问题简化为如下：已知ring buffer是一个大小为2048 * sizeof(long)的数组, 有一个RX线程往ring buffer里面保存mbuf的地址，有N个worker线程来从ring buffer里面获取mbuf的地址。在这种场景下如何来实现一个lock-free的buffer？</p>
+
+<p>在<a href="http://www.linuxjournal.com/content/lock-free-multi-producer-multi-consumer-queue-ring-buffer">Linux Journal</a>上有一个现成的实现，不过很可惜，虽然他的方案很巧妙，但是存在一个bug，稍后会解释这个bug。</p>
+
+<p>下面是一个简短实现这个lock-free ring的一段代码，我借鉴了linux journal上的那篇文章。具体的实现细节以及原理我不再描述，那篇文章描述的很详细，浅显明了。我在这里只解析它里面的那个bug。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">ptr_array_</span><span class="p">[</span><span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">T</span> <span class="o">*</span><span class="n">ret</span> <span class="o">=</span> <span class="n">ptr_array_</span><span class="p">[</span><span class="n">thr_pos</span><span class="p">().</span><span class="n">tail</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">];</span>
+</span><span class='line'>    <span class="n">thr_pos</span><span class="p">().</span><span class="n">tail</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面这两段代码均应该在那两个语句之间添加barrier，即：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cm">/* </span>
+</span><span class='line'><span class="cm"> * &quot;memory&quot; hints the compiler that it will touch the memory address,</span>
+</span><span class='line'><span class="cm"> * so the instructions before and after it should not be reordered.</span>
+</span><span class='line'><span class="cm"> */</span>
+</span><span class='line'><span class="cp">#define barrier() asm volatile(&quot;&quot;:::&quot;memory&quot;);</span>
+</span><span class='line'>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">ptr_array_</span><span class="p">[</span><span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">barrier</span><span class="p">();</span>
+</span><span class='line'>    <span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">T</span> <span class="o">*</span><span class="n">ret</span> <span class="o">=</span> <span class="n">ptr_array_</span><span class="p">[</span><span class="n">thr_pos</span><span class="p">().</span><span class="n">tail</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">];</span>
+</span><span class='line'>    <span class="n">barrier</span><span class="p">();</span>
+</span><span class='line'>    <span class="n">thr_pos</span><span class="p">().</span><span class="n">tail</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>否则它就可能会被编译器（gcc）给优化为比如如下：<br></p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">register</span>  <span class="n">tmp</span> <span class="o">=</span> <span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">;</span>
+</span><span class='line'><span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>
+</span><span class='line'><span class="n">ptr_array_</span><span class="p">[</span><span class="n">tmp</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>之所以做这个优化，是因为计算机的空间相近性原则，编译器会尽量将临近内存操作给放在一起以提高cache的命中率。
+对于共享内存模型的这种并发，C语言的编译器并不去关心哪些变量是共享的，它只是依据局部最优性原则来做优化。所以对于C程序员而言，在实现基于共享内存模型的这种并发时，C编译器的这种优化是很大的一个挑战， 它可能会引入一些很难以定位的bug。所以，用C来实现并发，尤其是lockfree的并发，是一个非常需要经验的技术活。</p>
+
+<p>好在instruction reordering 这种bug是可见的，我们可以通过反汇编来发现这种bug。如下是有无barrier的一段反汇编代码对比（注：以下反汇编直接引自我在我们系统里的实现，跟上面代码有出入，但这不重要）：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="c1">//1. 无barrier    </span>
+</span><span class='line'>   <span class="mo">0064001</span><span class="n">b</span> <span class="n">divu</span> <span class="n">zero</span><span class="p">,</span><span class="n">v1</span><span class="p">,</span><span class="n">a0</span>
+</span><span class='line'>    <span class="mf">008001f</span><span class="mi">4</span> <span class="n">teq</span> <span class="n">a0</span><span class="p">,</span><span class="n">zero</span><span class="p">,</span><span class="mh">0x7</span>
+</span><span class='line'>    <span class="mo">00001010</span> <span class="n">mfhi</span> <span class="n">v0</span>
+</span><span class='line'>    <span class="mo">000210</span><span class="mi">80</span> <span class="n">sll</span> <span class="n">v0</span><span class="p">,</span><span class="n">v0</span><span class="p">,</span><span class="mh">0x2</span>
+</span><span class='line'>    <span class="mo">004</span><span class="n">a1021</span> <span class="n">addu</span> <span class="n">v0</span><span class="p">,</span><span class="n">v0</span><span class="p">,</span><span class="n">t2</span>
+</span><span class='line'>    <span class="n">ac400044</span> <span class="n">sw</span> <span class="n">zero</span><span class="p">,</span><span class="mi">68</span><span class="p">(</span><span class="n">v0</span><span class="p">)</span>     <span class="err">#</span> <span class="n">ring_buf</span><span class="p">.</span><span class="n">pkt</span><span class="p">[</span><span class="n">tmp</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">aceb0014</span> <span class="n">sw</span> <span class="n">t3</span><span class="p">,</span><span class="mi">20</span><span class="p">(</span><span class="n">a3</span><span class="p">)</span>       <span class="err">#</span> <span class="n">ring_buf</span><span class="o">-&gt;</span><span class="n">thr_read</span><span class="p">[</span><span class="n">hwt_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+</span><span class='line'>
+</span><span class='line'><span class="c1">//2. 有barrier</span>
+</span><span class='line'>    <span class="n">aceb0014</span> <span class="n">sw</span> <span class="n">t3</span><span class="p">,</span><span class="mi">20</span><span class="p">(</span><span class="n">a3</span><span class="p">)</span>     <span class="err">#</span> <span class="n">ring_buf</span><span class="o">-&gt;</span><span class="n">thr_read</span><span class="p">[</span><span class="n">hwt_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>
+</span><span class='line'>    <span class="mo">0064001</span><span class="n">b</span> <span class="n">divu</span> <span class="n">zero</span><span class="p">,</span><span class="n">v1</span><span class="p">,</span><span class="n">a0</span>
+</span><span class='line'>    <span class="mf">008001f</span><span class="mi">4</span> <span class="n">teq</span> <span class="n">a0</span><span class="p">,</span><span class="n">zero</span><span class="p">,</span><span class="mh">0x7</span>
+</span><span class='line'>    <span class="mo">00001010</span> <span class="n">mfhi</span> <span class="n">v0</span>
+</span><span class='line'>    <span class="mo">000210</span><span class="mi">80</span> <span class="n">sll</span> <span class="n">v0</span><span class="p">,</span><span class="n">v0</span><span class="p">,</span><span class="mh">0x2</span>
+</span><span class='line'>    <span class="mo">004</span><span class="n">a1021</span> <span class="n">addu</span> <span class="n">v0</span><span class="p">,</span><span class="n">v0</span><span class="p">,</span><span class="n">t2</span>
+</span><span class='line'>    <span class="n">ac400044</span> <span class="n">sw</span> <span class="n">zero</span><span class="p">,</span><span class="mi">68</span><span class="p">(</span><span class="n">v0</span><span class="p">)</span>  <span class="err">#</span> <span class="n">ring_buf</span><span class="p">.</span><span class="n">pkt</span><span class="p">[</span><span class="n">tmp</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>instruction reordering引入的bug虽然挺折磨人，但毕竟是可见的。在并行程序里面还有一类bug则是完全不可见的，那就是memory reordering问题，这一类问题不仅仅是技术活了，更是意识活。在X86上，一般不会有memory reordering问题，因为它是strong order的，cache一致性做的比较好。但是在MIPS／ARM这种weak order的CPU上，memory reordering问题就比较突出，他们的cache一致性做的比较差，所以就需要显示的使用sync指令来保证cache的一致性，即通过软件来弥补硬件的不足。</p>
+
+<p>同样是上面这个例子：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">ptr_array_</span><span class="p">[</span><span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">&amp;</span> <span class="n">Q_MASK</span><span class="p">]</span> <span class="o">=</span> <span class="n">ptr</span><span class="p">;</span>  <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">语句</span><span class="n">A</span>
+</span><span class='line'>    <span class="n">barrier</span><span class="p">();</span>
+</span><span class='line'>    <span class="n">thr_pos</span><span class="p">().</span><span class="n">head</span> <span class="o">=</span> <span class="n">ULONG_MAX</span><span class="p">;</span>         <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">语句</span><span class="n">B</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>虽然加了barrier，确保了语句A一定会在语句B之前得到执行，但是如果<code>ptr_array_[]</code>和<code>thr_pos()</code>.head不在同一个cache line里面，就有可能存在<code>thr_pos()</code>.head先被同步到内存，<code>ptr_array_[]</code>后被同步到内存的情况，那么在这个时间空窗内，<code>thr_pos().head</code>已经被更新，它的previous value就可以被其他CPU使用，就会导致该CPU还没有写入其他CPU就从<code>ptr_array_[thr_pos().head &amp; Q_MASK]</code> 里读数据的情况，这自然会导致错误。如下图所示：<br></p>
+
+<center> <img src="http://laoar.github.io/images/lockfree-cache.jpg"> </center>
+
+
+<p>      <br/>
+PS: 这个图的L1 cache和L2 cache画反了，哇咔咔</p>
+
+<p>另外，在共享内存模型中关于lockfree算法的必备基本功是对atomic的认识。atomic是针对内存操作而言的，我们可以这样认为，如果一个语句对于同一个内存只访问一次，我们就认为它是atomic的。如果需要访问多次该内存，我们就得借助编译器或者操作系统提供的atomic函数来访问。</p>
+
+<p>以下是一些简单的例子来说明一下：<br></p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="mf">1.</span>
+</span><span class='line'>    <span class="kt">int</span> <span class="n">x</span><span class="p">;</span>
+</span><span class='line'>    <span class="c1">// 之所以用&amp;，是说这是个内存。同时，有了&amp;后，编译器不会将其优化为register变量。</span>
+</span><span class='line'>    <span class="o">*</span><span class="p">(</span><span class="o">&amp;</span><span class="n">x</span><span class="p">)</span> <span class="o">=</span> <span class="mh">0x12345678</span><span class="p">;</span> <span class="o">&lt;&lt;&lt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于32-bit CPU而言，它无法用一条语句来操作32bit的立即数，因为机器码只有32bit。所以它会做如下拆分（MIPS）：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="mi">3</span><span class="n">c027fff</span>    <span class="n">lui</span> <span class="n">v0</span><span class="p">,</span><span class="mh">0x1234</span>
+</span><span class='line'><span class="mi">344</span><span class="n">bffff</span>    <span class="n">ori</span> <span class="n">t3</span><span class="p">,</span><span class="n">v0</span><span class="p">,</span><span class="mh">0x5678</span>
+</span><span class='line'><span class="mo">00</span><span class="mi">804821</span>    <span class="n">sc</span>    <span class="n">t3</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span> <span class="err">#请不要在意为什么这里是</span><span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>虽然这条语句被编译为了3条指令，但是它只有一次内存访问，所以这个语句是原子的。即，内存写操作是原子的。同样，内存读操作也是原子的。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="mf">2.</span>
+</span><span class='line'>    <span class="k">volatile</span>  <span class="kt">int</span> <span class="n">x</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+</span><span class='line'>    <span class="k">volatile</span> <span class="kt">int</span> <span class="n">y</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">y</span> <span class="o">=</span> <span class="n">x</span><span class="p">;</span>   <span class="o">&lt;&lt;&lt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>虽然这里会访问两次内存操作，读x时要访问x所在的内存，写y时要访问y所在内存。但是它只访问一次y，所以对于y内存而言，是原子的。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">lw</span> <span class="n">v0</span><span class="p">,</span> <span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>    <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">读取变量</span><span class="n">x</span>
+</span><span class='line'><span class="n">sw</span> <span class="n">v0</span><span class="p">,</span> <span class="mi">16</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>   <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">存储给</span><span class="n">y</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>12(sp)和16(sp)是不同的内存地址，所以这条语句对于y而言是原子的。PS：如果还需要保证写入y之前x不被改写，那就要借助atomic_write函数了。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="mf">3.</span>
+</span><span class='line'>    <span class="k">volatile</span> <span class="kt">int</span> <span class="n">x</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+</span><span class='line'>    <span class="n">x</span><span class="o">++</span><span class="p">;</span>   <span class="o">&lt;&lt;&lt;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于这条语句而言，首先它会从内存中取出x，然后做加法运算，最后将运算结果写入到内存。如下汇编：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">lw</span>  <span class="n">v0</span><span class="p">,</span> <span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>  <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">第一次内存访问</span>
+</span><span class='line'><span class="n">add</span> <span class="n">v0</span><span class="p">,</span> <span class="n">v0</span><span class="p">,</span> <span class="mi">1</span>
+</span><span class='line'><span class="n">sw</span> <span class="n">v0</span><span class="p">,</span> <span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>  <span class="o">&lt;&lt;&lt;&lt;</span> <span class="err">第二次内存访问</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么这条x++这条语句就不是原子的，所以就得使用<code>atomic_add()</code>来操作x。</p>
+
+<p>简单的说，对于所有需要算数运算的操作，它都不是原子的。PS：只指对内存变量做算数运算</p>
+
+<h2>Ref.</h2>
+
+<ol>
+<li>我自己写的一个Single-Writer Multi-Reader lockfree的代码   <br/>
+<a href="https://github.com/laoar/Single-Writer-Mul-Reader-lock-free-ring">Single-Writer Multi-Reader lockfree Ring</a></li>
+</ol>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Open vSwitch datapath浅析]]></title>
+    <link href="http://laoar.github.io/blog/2015/04/27/open-vswitch/"/>
+    <updated>2015-04-27T21:43:46+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/04/27/open-vswitch</id>
+    <content type="html"><![CDATA[<p>下图所示是Open vSwitch的组成(摘自Open vSwitch官网):</p>
+
+<center><img src="http://laoar.github.io/images/main-comp.png"></center>
+
+
+<p></p>
+
+<p>它分为Kernel部分和User部分。</p>
+
+<h2>安装驱动</h2>
+
+<p>Kerenl部分是从Linux 2.6.32开始何如内核，默认是编译为一个KO，位于/lib/modules/`uname –r`/kernel/net/openvswitch/openvswitch.ko。</p>
+
+<center><img src="http://laoar.github.io/images/switch-kernel.png"></center>
+
+
+<p></p>
+
+<p>应用open vswitch首先要做的就是install这个kernel module。需要注意，GRE Tunneling的支持需要gre.ko, VXLAN的支持需要vxlan.ko, 这两个KO都位于/lib/modules/`uname –r`/kernel/路径下。</p>
+
+<p>user部分是有两个daemon，一个是ovs-vswitchd，用来管理datapath，另外一个是ovsdb-server，用来维护一个数据库。</p>
+
+<h2>初始化dbserver</h2>
+
+<p>在install好openvswitch.ko后，我们接着需要初始化这个ovsdb-server：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">opendb</span><span class="o">-</span><span class="n">server</span> <span class="o">--</span><span class="n">remote</span><span class="o">=</span><span class="n">punix</span><span class="o">:/</span><span class="n">usr</span><span class="o">/</span><span class="n">local</span><span class="o">/</span><span class="n">var</span><span class="o">/</span><span class="n">run</span><span class="o">/</span><span class="n">openvswitch</span><span class="o">/</span><span class="n">db</span><span class="p">.</span><span class="n">sock</span> \
+</span><span class='line'>            <span class="o">--</span><span class="n">remote</span><span class="o">=</span><span class="n">Open_vSwitch</span><span class="p">,</span><span class="n">Open_vSwitch</span><span class="p">,</span><span class="n">manager_option</span> <span class="err">\</span>
+</span><span class='line'>            <span class="o">--</span><span class="n">pidfile</span> <span class="o">--</span><span class="n">detach</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>此时会生成一个数据库文件（/usr/local/etc/conf.db）,该dbserver会将网络状态信息给记录到conf.db里面。这些网络状态使得open vswitch能够适应网络的动态变化，比如可以用来追踪VM的迁移。  <br/>
+这个dbserver还可以通过TCP的6632端口跟远端的openflow server进行通信，这个openflow server可以通过remote这个参数来指定。</p>
+
+<h2>启动ovs－vswitchd</h2>
+
+<p>接下来就需要启动ovs-vswitchd：</p>
+
+<blockquote><p>ovs-vswitchd &mdash;pidfile &mdash;detach</p></blockquote>
+
+<p>整个OVS的核心就是这个ovs-vswitchd。  <br/>
+这样子open vswich就在PC上运行起来了。</p>
+
+<h2>构建网络拓扑</h2>
+
+<p>我们来构建如下图所示的一个网络拓扑：</p>
+
+<center> <img src="http://laoar.github.io/images/switch-topo.png"> </center>
+
+
+<p></p>
+
+<h4>首先需要增加一个bridge(br0)</h4>
+
+<blockquote><p>ovs-vsctl add-br br0</p></blockquote>
+
+<p>执行这个命令后，</p>
+
+<ol>
+<li>将br0记录到ovsdb里面</li>
+<li>ovs-vswitchd创建一个新的bridge</li>
+<li>ovs-vswitchd通过netlink这种方式，发相应的cmd给kernel，执行对应的handler来生成一个datapath以及和其相关的一些结构体。  <br/>
+每个bridge都对应于一个datapath结构体。</li>
+</ol>
+
+
+<h4>接着来将网络结构设备连接到该bridge</h4>
+
+<blockquote><p>ovs-ctl add-port br0 eth1</p></blockquote>
+
+<p>执行这个命令后，  <br/>
+1.  将该信息记录到ovsdb   <br/>
+2. ovs-vswitchd在bridge上新增一个端口，并将其设置为混杂模式（NETDEV_PROMISC），设置为混杂模式的目的是为了接收非本机MAC地址的包   <br/>
+3. ovs-vswitchd通过netlink调用到kernel端的handler，此时：</p>
+
+<pre><code>1. 找到“eth1”对应的net\_device     
+2.  把该net\_device的handler替换为ovs的handler，这样net\_device的进包就不会进入普通的内核处理流程，而是由OVS接收过来处理。    
+3. 产生一个新的vport结构体    
+</code></pre>
+
+<p>整个过程如下图所示：</p>
+
+<center><img src="http://laoar.github.io/images/switch-handler.png"></center>
+
+
+<p>  <br/>
+至此，就初始化完成了kernel module的主要结构体datapath/vport/flow_table。这些主要结构体的关系如下图所示：</p>
+
+<center><img src="http://laoar.github.io/images/switch-struct.png"> </center>
+
+
+<p></p>
+
+<h4>设置openflow server</h4>
+
+<p>下面这个命令可以用来设置远端用来和ovs-vswitchd通信的openflow server：</p>
+
+<blockquote><p>ovs-vsctl set-controller br0 tcp:XXX.XXX.XXX.XXX:6633</p></blockquote>
+
+<p>如下图所示：</p>
+
+<center><img src="http://laoar.github.io/images/switch-controller.png"> </center>
+
+
+<p>  <br/>
+根据不同的设备类型，ovs实现了不同的vport以作支持。目前OVS共支持了6种vport：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">A</span><span class="p">.</span> <span class="n">Network</span> <span class="n">device</span> <span class="o">:</span> <span class="n">tap</span> <span class="o">&amp;</span> <span class="n">system</span> <span class="n">device</span>
+</span><span class='line'><span class="n">B</span><span class="p">.</span> <span class="n">Network</span> <span class="n">device</span> <span class="n">implemented</span> <span class="n">by</span> <span class="n">datapath</span><span class="o">:</span> <span class="n">internal</span> <span class="n">device</span>
+</span><span class='line'><span class="n">internal</span> <span class="n">device</span><span class="err">存在的目的是为了给</span><span class="n">bridge</span><span class="err">分配</span><span class="n">IP</span><span class="err">地址。</span>
+</span><span class='line'><span class="n">C</span><span class="p">.</span> <span class="n">GRE</span> <span class="n">tunnel</span>
+</span><span class='line'><span class="n">D</span><span class="p">.</span> <span class="n">GRE64</span> <span class="n">tunnel</span>
+</span><span class='line'><span class="n">E</span><span class="p">.</span> <span class="n">VXLAN</span> <span class="n">tunnel</span>
+</span><span class='line'><span class="n">F</span><span class="p">.</span> <span class="n">LISP</span> <span class="n">tunnel</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>以ping为例子来看下包处理流程</h2>
+
+<p>VM0来ping VM1.   <br/>
+当vm0以ping发送一个ICMP报文给OVS时，OVS会依次进行如下处理：</p>
+
+<ol>
+<li>ping  <br/>
+VM0发送报文到tap0， tap0和br0的一个端口相连。br0的端口对应一个vport结构体。</li>
+<li>ovs receive   <br/>
+ovs执行tap0的receive handler，（即在前面执行ovs-ctl add-port br0 eth1 tag=XXX时注册的那个handler）  <br/>
+tag=XXX就是vlan，通过vlan来实现网络隔离的功能。</li>
+<li>flow key   <br/>
+从sk_buff中解析出来L2～L4的信息生成一个flow_key.   <br/>
+flow可以理解为一个以太网包所包含的头部信息的集合，在一个flow table里面的一个flow必须是唯一的，它是包含L2/L3/L4这些头部的一个细粒度的实体。一个TCP连接由两个flow组成，每个方向上有一个。</li>
+</ol>
+
+
+<center><img src="http://laoar.github.io/images/switch-flow-key.png"></center>
+
+
+<p>  <br/>
+4. flow lookup   <br/>
+使用该key来执行flow_lookup, 去跟kernel module里面维护的flow table进行比较。  <br/>
+首先去跟 flow_table里的 mask_cache数组进行比较， mask_cache里面只有 sk_buff的 hash值所以很快速；  <br/>
+接着再去跟 mask_array这个数组进行比较，这个数组里面存放是的 sw_flow_key, 查找相对慢一些。  <br/>
+如果在 mask_array里面匹配到了这个 flow，就会把该 sk_buff的 hash值给放到 mask_cache里面。   <br/>
+在 kenerl里的这部分比较称之为 ovs的 fast path</p>
+
+<center><img src="http://laoar.github.io/images/switch-path.png"> </center>
+
+
+<p>  <br/>
+5. flow action   <br/>
+如果在kernel中查找到了对应的flow entry，就去执行对应的flow action。  <br/>
+这些action是告诉datapath怎么去处理flow里面的这些packets。  <br/>
+action也可以为空，即丢弃这些packets。  <br/>
+datapath的这些action跟openflow定义的action是一致的。  <br/>
+6. send upcall  <br/>
+ 如果没有match到，就执行upcall通过netlink的方式给ovs-vswitchd发送OVS_PACKET_CMD_MISS命令。  <br/>
+UPCALL会包含整个packet，虽然不必要拷贝整个的packet给user space，可以做一些优化，但是由于只是拷贝first packet（比如TCP SYN），所以这种优化意义不大，而且有时候可能真的会用到整个packet。   <br/>
+ovs-vswitch一次只处理一个upcall，为了能够让每一个port产生的upcall都能够得到即使处理，datapath是采用的round robin这种方式来让每个port发送upcall。  <br/>
+UPCALL发送出去后，dadapath的处理就结束了。  <br/>
+一个普通的UPCALL结构如下图所示。</p>
+
+<center><img src="http://laoar.github.io/images/switch-upcall.png"></center>
+
+
+<p>  <br/>
+7. handle upcall   <br/>
+ovs-vswitchd执行read_upcalls来读取upcall。  <br/>
+ read_upcalls的主要处理流程如下图所示。</p>
+
+<center><img src="http://laoar.github.io/images/switch-routine.png"> </center>
+
+
+<p>  <br/>
+Hash bucket的数据结构是hmap，如下图所示</p>
+
+<center><img src="http://laoar.github.io/images/switch-hmap.png"></center>
+
+
+<p>  <br/>
+8. flow table match
+在userspace维护着openflowtable。对hmap里面的flow以wildcard的方式来与openflowtable匹配。  <br/>
+Openflowtable的匹配过程大致如下图。</p>
+
+<center><img src="http://laoar.github.io/images/switch-flow-table.png"> </center>
+
+
+<p>  <br/>
+9. MAC learning   <br/>
+在open vswitch里面配置MAC learning功能</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">ovs</span><span class="o">-</span><span class="n">ofctl</span> <span class="n">add</span><span class="o">-</span><span class="n">flow</span> <span class="n">br0</span> <span class="err">\</span>
+</span><span class='line'>  <span class="s">&quot;table=2 actions=learn(table=10, NXM_OF_VLAN_TCI[0..11], \</span>
+</span><span class='line'><span class="s">    NXM_OF_ETH_DST[]=NXM_OF_ETH_SRC[], \</span>
+</span><span class='line'><span class="s">    load:NXM_OF_IN_PORT[]-&gt;NXM_NX_REG0[0..15]), \  </span>
+</span><span class='line'>    <span class="n">resubmit</span><span class="p">(,</span><span class="mi">3</span><span class="p">)</span><span class="err">“</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<center><img src="http://laoar.github.io/images/switch-learning.png"> </center>
+
+
+<p></p>
+
+<h2>Ref：</h2>
+
+<ul>
+<li><a href="https://www.opennetworking.org/images/stories/downloads/sdn-resources/onf-specifications/openflow/openflow-spec-v1.4.0.pdf">Openflow spec 1.4.0</a></li>
+<li><a href="http://openvswitch.org/releases/openvswitch-2.3.1.tar.gz">Open vswitch 2.3.1</a></li>
+<li><a href="https://github.com/openvswitch/ovs/blob/master/WHY-OVS.md">Why OVS ?</a></li>
+<li><a href="http://openvswitch.org/support/config-cookbooks/">Example</a></li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[编译器输出函数的算法对性能的影响]]></title>
+    <link href="http://laoar.github.io/blog/2015/03/31/algorithm/"/>
+    <updated>2015-03-31T21:31:53+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/03/31/algorithm</id>
+    <content type="html"><![CDATA[<h2>TL;DR</h2>
+
+<p>对于这个问题的研究也是缘于我们firewall的UDP吞吐量的波动。</p>
+
+<p>在之前讨论过通过Makefile，链接脚本和gcc的attribute属性来控制编译器输出函数的顺序。然而在做了这些工作后，依然存在无关代码commit后引起性能波动的诡异现象，在对比了不同版本的二进制文件后发现有些commit会引起函数顺序的重排，这些重排就容易造成性能的波动。于是我就开始了做这个方面的研究，来分析编译器是如何调整函数顺序的以及能否进行优化。</p>
+
+<h2>什么是call-graph</h2>
+
+<p>首先，要明白一个概念：call-graph。</p>
+
+<p>call graph是用来表示函数调用关系的一个有向图。  <br/>
+我们可以通过gprof来获取一个函数的call graph，gprof是在函数运行过程中来获取函数调用关系（所以不会被执行到的函数就不会出现在call graph中）。</p>
+
+<p>如下是一个简单的示例：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="kt">void</span> <span class="nf">foo</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="c1">//...</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span> <span class="nf">bar</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="c1">// ...</span>
+</span><span class='line'>    <span class="n">foo</span><span class="p">();</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">void</span> <span class="nf">func</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="c1">// ...</span>
+</span><span class='line'>    <span class="n">foo</span><span class="p">();</span>
+</span><span class='line'>    <span class="n">bar</span><span class="p">();</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么对应的call graph就是  <br/>
+<img src="http://laoar.github.io/images/algo.png">  <br/>
+在call-graph里，函数称为节点（node），比如func/foo/bar就是节点；一个调用称为边（edge），比如func指向foo的那个边。这跟图论是一致的。</p>
+
+<h2>top level function</h2>
+
+<p>还需要明白一个概念：top level function。</p>
+
+<p>接着前面的示例代码片段，我们加上main函数组成一个完整的程序。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="kt">void</span> <span class="nf">run</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">p</span><span class="p">)</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="o">*</span><span class="n">p</span><span class="p">();</span>
+</span><span class='line'><span class="p">}</span>
+</span><span class='line'>
+</span><span class='line'><span class="kt">int</span> <span class="nf">main</span><span class="p">()</span>
+</span><span class='line'><span class="p">{</span>
+</span><span class='line'>    <span class="n">run</span><span class="p">(</span><span class="n">func</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>此时<code>func()</code>这个函数就是一个top level函数，即没有函数直接来调用的函数。  <br/>
+对于这一类的函数，由于没有函数来直接调用它，因而在函数的入口处就没有必要保存寄存器信息。 我们可以使用__toplevel这个属性来显示的告诉编译器这是一个top level function。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="kt">void</span> <span class="n">func</span><span class="p">()</span> <span class="n">__toplevel</span><span class="p">;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>编译器输出函数的顺序是怎么样的</h2>
+
+<p>我们来看下gcc的源码</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">compile</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>     <span class="n">output_asm_statements</span> <span class="p">();</span>
+</span><span class='line'>     <span class="n">expand_all_functions</span> <span class="p">();</span>
+</span><span class='line'>     <span class="n">varpool_output_variables</span> <span class="p">();</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一些解释：  <br/>
+1. asmstatements function  <br/>
+   这是Basic Asm (Assembler Instructions Without Operands),比如：</p>
+
+<pre><code>  #define DebugBreak() asm("int $3") 
+</code></pre>
+
+<ol>
+<li><p>Varpool variables  <br/>
+  这个是所有的静态变量</p></li>
+<li><p><code>expand_all_functions</code> 是输出函数的主体，这个是我们接下来要关注的。</p></li>
+</ol>
+
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">expand_all_functions</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>     <span class="k">struct</span> <span class="n">cgraph_node</span> <span class="o">**</span><span class="n">order</span> <span class="o">=</span> <span class="n">XCNEWVEC</span> <span class="p">(</span><span class="k">struct</span> <span class="n">cgraph_node</span> <span class="o">*</span><span class="p">,</span> <span class="n">cgraph_n_nodes</span><span class="p">);</span>     <span class="c1">// 首先申请一块内存用来存储call graph里面所有的节点信息</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>     <span class="n">ipa_reverse_postorder</span> <span class="p">(</span><span class="n">order</span><span class="p">);</span> <span class="c1">// 以reverse post-ordering的方式来遍历整个call graph，并将遍历结果存储在order里面</span>
+</span><span class='line'>     <span class="p">...</span>
+</span><span class='line'>     <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="n">new_order_pos</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span><span class="o">--</span><span class="p">)</span> <span class="p">{</span> <span class="c1">// 从最后一个元素往前依次输出所有的函数。 </span>
+</span><span class='line'>          <span class="p">...</span>
+</span><span class='line'>          <span class="n">expand_function</span> <span class="p">(</span><span class="n">node</span><span class="p">);</span>
+</span><span class='line'>          <span class="p">...</span>
+</span><span class='line'>     <span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>也就是以revserse preodering方式来深度优先遍历call-graph，然后以这个顺序的逆序输出，即以bottom-up的方式来输出call-graph里面的node。</p>
+
+<h2>编译器以这个顺序来输出函数的目的是什么</h2>
+
+<p>编译器没有按照函数在文件里面的先后顺序输出，而是基于call graph输出。这样做是因为，子程序和他们的调用者在时间上可能相互接近，因此应当在放置时使得他们在空间上互不冲突，所以将子程序放在他们的调用者附近以减少页交换，并且使得频繁使用的和有关联的子程序在icache中以相互之间冲突较小的方式放置。</p>
+
+<p>还要注意，它是以bottom-up的顺序输出，而不是按照top-down的顺序输出，这也说明，这样做优化的目的没有考虑函数的先后顺序，为什么不按照函数的调用顺序来输出呢？比如a调用b，那么就把b放在a的后面，这样在执行a的时候就把b给预取到内存不是很好么。事实上，预取是以cache line为单位的，一个cache line的大小是128字节或者64字节或者32字节，而函数的大小远不止这么大，函数调用时会有地址跳转，因而按照调用顺序来放置意义不是太大。</p>
+
+<p>以bottom-up的方式来遍历call-graph也是基于一次遍历的考虑，这样可以在遍历call-graph的每一个节点时就可以采用合理的策略来分配寄存器。比如，在main函数里面使用的寄存器，只有在保存后才可以被它的子程序使用；相反，所有leaf functoin可以使用相同的寄存器，因为这些leaf function不会同时执行（单线程情况）。以bottom-up方式输出，那么在函数调用时，callee使用的寄存器是已知的因为callee已经被处理过了，通过避免重复使用这些寄存器就可以避免save/restore。</p>
+
+<p>科普一些基本知识。
+在有函数调用时，编译器将寄存器分为三类：  <br/>
+&ndash; callee-saved registers.  <br/>
+这些寄存器要求在函数调用时，由被调用者来保存  <br/>
+&ndash; caller-saved registers.  <br/>
+这些寄存器要求在函数调用时，由调用者来保存  <br/>
+&ndash; 4个参数传递寄存器  <br/>
+在函数调用时用来传递参数  <br/>
+比如对于MIPS而言，s0~s7是callee-saved, t0~t9是caller-saved，a0~a3是传递参数的寄存器.</p>
+
+<h2>这种输出顺序是否可以控制</h2>
+
+<p>通过源码我们可以发现在<code>compile()</code>这个函数里，有个flag可以决定是以自然顺序输出函数还是以优化顺序输出函数。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">compile</span>
+</span><span class='line'>  <span class="nf">if</span> <span class="p">(</span><span class="o">!</span><span class="n">flag_toplevel_reorder</span><span class="p">)</span>
+</span><span class='line'>    <span class="n">output_in_order</span> <span class="p">();</span>    <span class="c1">// 这里以函数在文件中出现的顺序输出。</span>
+</span><span class='line'>  <span class="k">else</span>
+</span><span class='line'>    <span class="p">{</span>
+</span><span class='line'>      <span class="n">output_asm_statements</span> <span class="p">();</span>
+</span><span class='line'>      <span class="n">expand_all_functions</span> <span class="p">();</span>
+</span><span class='line'>      <span class="n">varpool_output_variables</span> <span class="p">();</span>
+</span><span class='line'>    <span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个flag就是通过-fno-toplevel-reorder 来控制的。这个选项是在gcc-4.1加入的，这个选项加入的目的是为了支持以前存在的依赖特定顺序的代码（参见gcc-4.1的release note）。</p>
+
+<h2>使用-fno-toplevel-reorder的坏处</h2>
+
+<p>使用这个选项后，gcc将按照函数在文件中出现的顺序输出，这可能会降低程序的性能，但是如果我们使用了attribute 来将热点函数给放到了一起，那么gcc的reorder对性能的影响就不是太大了，甚至gcc的reorder可能会降低程序的性能（这也说明gcc在这方面的优化做的还有待改进）。</p>
+
+<p>使用这个选项后一个比较明显的坏处是，那些未被使用的static变量将仍然存在于最终生成的程序中，而如果不使用这个选项这些冗余的static变量会自动的被编译器给删除。</p>
+
+<p>那些在程序中没有调用的函数，在call-graph中称为不可达的节点，他们跟这个选项无关，不论这个选项使用与否都会被删除。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">finalize_compilation_unit</span>
+</span><span class='line'>      <span class="p">...</span>
+</span><span class='line'>     <span class="cm">/* Gimplify and lower all functions, compute reachability and</span>
+</span><span class='line'><span class="cm">          remove unreachable nodes.  */</span>
+</span><span class='line'>       <span class="n">analyze_functions</span> <span class="p">();</span>     <span class="c1">// 在这里会分析这些call graph里面的所有节点，从而将不可达节点删除</span>
+</span><span class='line'>       <span class="p">...</span>
+</span><span class='line'>       <span class="n">compile</span><span class="p">();</span>
+</span><span class='line'>       <span class="p">...</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>未完待续</h2>
+
+<p>对于编译器分配寄存器这一块，我的研究还不够深入，有些地方也不能很清楚的解释细节，这有些惭愧。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[《Linux内核网络栈源代码情景分析》读后感]]></title>
+    <link href="http://laoar.github.io/blog/2015/02/28/comments/"/>
+    <updated>2015-02-28T22:44:50+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/02/28/comments</id>
+    <content type="html"><![CDATA[<p>源自我的豆瓣日记：<a href="http://book.douban.com/review/7370625/">不需要读第二遍的书</a></p>
+
+<p>不需要读第二遍不是说这本书很烂，而是，它的内容确实不需要读第二遍，读一遍就够了，没有需要反复咀嚼的知识.</p>
+
+<p>这本书描述协议栈的视角很独辟蹊径，很适合学习网络协议栈入门时先翻一翻。它纯粹是从源码的角度来讲解协议栈，因为网络协议栈本身的分层设计就是为了简洁，所以它同样为了简洁明了，也从网络分层的角度来讲解，这就给入门者提供了一个快速切入的视角，能够从宏观上理解整个协议栈到底是怎么一回事。而且它选用的内核版本是1.2.13，源代码都是网络协议栈最核心的部分，比较容易梳理。</p>
+
+<p>我重点看了这本书里对arp.c,ip.c,ip_fw.c,tcp.c这几个文件的讲解，很不出意外的是，这本书里面出现了一些错误。比如，</p>
+
+<p>P545 ：</p>
+
+<blockquote><p>对于raw类型套接字，不使用IP协议，</p></blockquote>
+
+<p>这里明显不对。实际上是由于raw套接字，用户会提供IP header，所以不需要创建IP header。</p>
+
+<p>P705:</p>
+
+<blockquote><p>如果上次使用时间在10min之内，则清除该表项</p></blockquote>
+
+<p>应该是“如果上次使用时间在10min之外”。 PS：不清楚这是否是粗心或者印刷问题导致。</p>
+
+<p>这本书用的内核版本有很多很明显的bug，比如ip.c的<code>ip_rcv</code>这个函数里面竟然是以报文的<code>frag_off</code>是否为零来判断有无分片，显然把首个分片报文（<code>frag_off</code>为0）给忽略了。</p>
+
+<p>总体而言，本书侧重于对源码的解释，对一些基本的网络概念讲解不够好，或者没有讲解。比如对于“面向报文”和“面向流”区别的解释，就有些不知所云。之所以说这本书不需要读第二遍，就是这个原因，作者没有自己的见解在里头，只是给我们提供了一个方便的视角来看源码。</p>
+
+<p>对于协议栈初学者而言，在读这本书时，要结合《深入理解linux网络内幕》那本书一起看，那本书对网络的基本概念讲解的特别好，非常清晰明了。   <br/>
+另外，对于所有的网络从业者，甚至说软硬件工程师，《TCP／IP详解卷一》都是必读之书，而且是需要反复去读，读一遍显然是不够的。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[The Fight In Rank 4d]]></title>
+    <link href="http://laoar.github.io/blog/2015/01/04/the-fight-in-rank-4d/"/>
+    <updated>2015-01-04T00:00:00+08:00</updated>
+    <id>http://laoar.github.io/blog/2015/01/04/the-fight-in-rank-4d</id>
+    <content type="html"><![CDATA[<!DOCTYPE HTML>
+<html>
+	<head>
+		<!--mkdir 3rd-party/ under octopress/source/ first, then we put wgo library under the 3rd-party directy, so we can get the file in wgo/ with '/3rd-party/wgo/file', and create our own html files in octopress. -->
+    	<script type="text/javascript" src="http://laoar.github.io/3rd-party/wgo/wgo.min.js"></script>
+    	<script type="text/javascript" src="http://laoar.github.io/3rd-party/wgo/wgo.player.min.js"></script>
+    	<link type="text/css" href="http://laoar.github.io/3rd-party/wgo/wgo.player.css" rel="stylesheet" />
+	</head>
+	<body>
+		<h2><center>四段的对杀</center></h2>
+		<h2><center>The Fight in Rank-4D</center></h2>
+		<br>
+		<h4><center>In memory of the progress with my friend wood.</center></h4>		
+        <div data-wgo="/3rd-party/wgo/game.sgf" style="width: 700px"></div>
+	</body>
+</html>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[My Reading in 2014]]></title>
+    <link href="http://laoar.github.io/blog/2014/12/27/reading-2014/"/>
+    <updated>2014-12-27T06:32:01+08:00</updated>
+    <id>http://laoar.github.io/blog/2014/12/27/reading-2014</id>
+    <content type="html"><![CDATA[<p>This article was automatically generated via <a href="https://github.com/laoar/booklist">Booklist</a>, which is wrote in Ruby by @laoar. It&#8217;s open to everyone. Feel free to use it.</p>
+
+
+<p>Below are the books @laoar have read in 2014. There&rsquo;re totally 23 books, that&rsquo;s approximately 1.92 books per month, not a bad number. Pls. keep proceeding.<br><br></p>
+
+<h3>1.   Ruby元编程</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s7014167.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+读完了ruby的这部分，以后再读rails这部分。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>2.   C程序性能优化</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s24611330.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+日本技术人员在一些领域上总是会钻研的很深，他们写的书总有一些参考价值。这本书对我对性能优化的理解很有帮助，虽然大部分内容都无用，然后有那么几句话切实的帮到了我就够了，一本好书！</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>3.   Zero to One</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s27463048.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+The author Peter Thiel is  a legendary person. This book descripts his experice on the companies which he has found or invested.</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>4.   图解网络硬件</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s27316002.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+讲的很全面，很好的入门读物。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>5.   自由之魂</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s27086436.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+可是都去了台湾。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>6.   Of Mice and Men</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s4734995.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+Reads like ancient English, i.e. ya, ta, wun&#8217;t. Not sure whether it is because of printing or not, but this is the first kindle book I purchased on amazon.com, which took me around 8$. The two men were both dependent on each other and had a common dream, going through so many difficuties, however the dream was broken at last. Sorrowful ending.</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>7.   HTML 5 与 CSS 3 权威指南</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s4696737.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+对于不了解html和css的，不适合读这本书。像一本手册，不适合系统学习。作者费这么多心思来搜集网上的资料，大致也能了解html5/css3能够做什么。</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>8.   A Tale of Two Cities</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s2789809.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+Charles Dickens&#8217; words are so beautiful.</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>9.   Hard Choices</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s27312699.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+Chapters related to China  are as follows, chap. 4, 5 and 25.  Nevertheless, it can broaden our view.</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>10.   图解HTTP</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s27283822.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+http快速入门，看完之后能够让你对http了解一个大概，不深入，入门。对于没有网络基础的人而言很适用。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>11.   松本行弘的程序世界</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s11290956.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+ruby版《深入理解计算机系统》。侧重理论讲解，离实际应用还很远。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>12.   The Old Man and the Sea</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s9068443.jpg"></center>
+
+
+<p><strong>rating: </strong>★☆☆☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+Looks wierd that it won for Hemingway both Pulitzer and Nobel Prize. It descibes a old fisherman&#8217;s three days&#8217; struggling on the sea just because of a big fish which in his mind represents pride, hornor, faith, goal or something.   This kind of book, per my understanding, only deserves one star. That&#8217;s all.</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>13.   The Shortest History of Europe</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s4489600.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+It&#8217;s a special perspective that interpreting the history not by timeline, but by the religion, goverment and language.  It mentioned China as well, with the purpose to explain why Europe was the first to industrialise.</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>14.   The Fault in Our Stars</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s10394551.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+Very sad love story of young adult. It&#8217;s NOTHING but a commercial book, which only aims to sell more copies.  I would recommend it for none.</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>15.   Programming Ruby</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s4244255.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+The introduction to Ruby. NO rails, and metaprogramming.</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>16.   The Crowd</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s3363313.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+Full of rumor stories, lack of agumentation. It can&#8217;t convinced me withouth enough evidence, but inerest me beause of his point of view. Compared to novel, this kind of book is very hard to read in English.</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>17.   Animal Farm</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s11909707.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+Orwell is good at using very simple story to explain the truth.Took me few days finish it.Pretty easy reading.It&#8217;s an allegory of the Russian Revolution.The farmer(Nicholas II),Major(Lenin/Marx),Snowball(Leon Trosky)，Napoleon(Stalin),Boxer(the peasants),dogs(The Party).Regarding China, it&#8217;s same.Framer(蒋？)，Major(李大钊/陈独秀),Snowball(刘)，Naploeon(哼～).</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>18.   Atlas Shrugged</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s1448069.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+花了差不多三个月读完了这本英文皇皇巨著。 I will never live for the sake of another man, nor ask another man to live for min. 安兰德在这本书里宣扬的是自私经济学，反对所谓共产主义。书名来自于Fransisco和Realdan的对话，Atalas holds the world on his shoulders, with his blood running, yet still making greate effort to hold the world aloft.  He need a shrug to relex himself.    很好奇Golt的理想国最后会是什么结局？可惜安兰德没有写。</p>
+
+
+<p>[hmm&#8230;]</p>
+
+
+<br>
+
+
+
+
+<h3>19.   代码的未来</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s26393136.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+不愧为大师，能够用很通俗的语言把很高深的技术描述的很清楚。 而且把各种技术关联在一起，正应了那句话，技术总是相同的，牛人的牛逼之处就在于能够触类旁通。总之，这本书给我的帮助很大。</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>20.   黑客与画家</h3>
+
+
+<center><img src="http://img3.douban.com/mpic/s4669554.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+如果不是那几篇谈论编程语言的文章，我真想给它2星。许多文章是又丑又长，一个观点反反复复变换着各个法儿的说，味同嚼蜡。另外，关于未来的编程语言，我还是觉得松本行弘在《代码的未来》里说的更好。</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>21.   台湾念真情</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s11150599.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★☆</p>
+
+
+<p><strong>comment:</strong><br>
+乡土民情。台湾人的文字很优雅。</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h3>22.   图解TCP/IP : 第5版</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s26676928.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★☆☆</p>
+
+
+<p><strong>comment:</strong><br>
+TCP/IP快速入门，以及索引。 译者的计算机背景似乎不是很强，比如第24页，“最典型的时大实体和小实体”，有点莫名其妙，实则应该是“大端和小端”。</p>
+
+
+<p><font color=green>[Good job!]</font></p>
+
+
+<br>
+
+
+
+
+<h3>23.   父与子全集</h3>
+
+
+<center><img src="http://img5.douban.com/mpic/s1094608.jpg"></center>
+
+
+<p><strong>rating: </strong>★★★★★</p>
+
+
+<p><strong>comment:</strong><br>
+温馨</p>
+
+
+<p><font color=red>[Hey slacker, can&#8217;t U read it seriously and give more comment?]</font></p>
+
+
+<br>
+
+
+
+
+<h2>Statistics</h2>
+
+
+<br><img src="http://laoar.github.io/images/human_lang.png"><img src="http://laoar.github.io/images/details_month.png">
+
+]]></content>
+  </entry>
+  
+</feed>

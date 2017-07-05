@@ -1,41 +1,544 @@
-<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+
+<!DOCTYPE HTML>
 <html>
 <head>
-<title>Duanwujie's Blog</title>
-<meta charset='utf-8'>
-<meta http-equiv="X-UA-Compatible" content="chrome=1">
+	<meta charset="utf-8">
+	<title>One Man's Yammer</title>
+	<meta name="author" content="Yafang Shao">
 
-<link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen">
-<link rel="stylesheet" type="text/css" href="stylesheets/github-dark.css" media="screen">
-<link rel="stylesheet" type="text/css" href="stylesheets/print.css" media="print">
+	
+	<meta name="description" content="2017 strace是如何工作的 ? 擅用工具是最好的学习方式 为什么使能RPS/RFS, 或者RSS/网卡多队列后，QPS反而下降？ Linus: Direct IO是个很脑残的设计 Qcon北京2017参会总结 My talk at Qcon Bejing 2017 A sad story &hellip;">
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 
-
-<!-- ^ Position is not set to relative / absolute here because of Mozilla -->
+	<link href="" rel="alternate" title="One Man's Yammer" type="application/atom+xml">
+	<link rel="canonical" href="">
+	<link href="/favicon.png" rel="shortcut icon">
+	<link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+	<!--[if lt IE 9]><script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+	<script async="true" src="//ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+	
 </head>
-<!-- <body> -->
 
-<body style="background-image:url(你的图片地址);background-position:center; background-repeat:repeat-y">
-<p>CPA
-<ul>
-<li><a href="accounting.html">会计</a></li>
 
-<li><a href="audit.html">审计</a></li>
-
-<li><a href="e.html">经济法</a></li>
-
-<li><a href="tax.html">税法</a></li>
-
-<li><a href="cost.html">财务成本管理</a></li>
-
-<li><a href="risk.html">公司战略与风险管理</a></li>
-<li><a href="pf.html">复利现值系数表</a></li>
-<li><a href="pa.html">年金现值系数表</a></li>
+<body>
+	<header id="header" class="inner"><h1><a href="/">One Man's Yammer</a></h1>
+<nav id="main-nav"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
 </ul>
-
-<p>Technology
-<ul>
-<li><a href="autoconf.html">Autoconf 基础</a></li>
+</nav>
+<nav id="mobile-nav"> <ul class="main">
+	<li><a href="/read">BookWall</a></li>
 </ul>
+ </nav>
+<!--	<div class="menu"> --!>
+		<!--<a class="button">Menu</a>
+		<div class="container"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</div>--!>
+	<!--</div>--!>
+<!--</nav>--!>
+<!-- @yfshao
+	<div class="alignright search">
+		<a class="button"></a>
+		<div class="container">
+			<form action="false" method="get">
+				<input type="text" name="q" results="0">
+				<input type="hidden" name="q" value="site:laoar.github.io">
+			</form>
+		</div>
+	</div>
+</nav>
+--!>
+<!--
+<nav id="sub-nav" class="alignright">
+	<div class="social">
+		
+		
+		
+		
+    
+		
+		
+		
+		
+		
+    
+	</div>
+	<form class="search" action="false" method="get">
+		<input class="alignright" type="text" name="q" results="0">
+		<input type="hidden" name="q" value="site:laoar.github.io">
+	</form>
+</nav>
+--!>
+<!----!>
+</header>
+	
+		
+	
+	<div id="content" class="inner"><meta content="width=device-width,user-scalable=no" name="viewport">
+
+
+
+
+
+    
+    
+	<section class="archives">
+		<h1 class="year">2017</h1>
+
+		<article>
+    		<a href="/blog/2017/06/12/strace/">strace是如何工作的 ?</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/06/04/wireshark-comment/">擅用工具是最好的学习方式 </a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/05/07/rps/">为什么使能RPS/RFS, 或者RSS/网卡多队列后，QPS反而下降？</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/04/28/directio/">Linus: Direct IO是个很脑残的设计</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/04/28/comments-on-qcon/">Qcon北京2017参会总结</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/04/23/qcon2017/">My talk at Qcon Bejing 2017</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2017/03/26/continue/">A sad story</a>
+		</article>
+    
+
+
+
+
+    
+    
+    
+	<section class="archives">
+		<h1 class="year">2016</h1>
+
+		<article>
+    		<a href="/blog/2016/05/14/comments-on-breg/">Brendan Gregg: 一个实战派大神</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2016/03/02/nginx/">Linux内核分析： OOM杀掉nginx后导致的系统hang问题</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2016/02/29/highload/">Linux内核分析：页回收导致的cpu load瞬间飙高的问题分析与思考</a>
+		</article>
+    
+
+
+
+
+    
+    
+    
+	<section class="archives">
+		<h1 class="year">2015</h1>
+
+		<article>
+    		<a href="/blog/2015/12/05/performance-tuning/">性能优化：来龙及去脉</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/09/04/namespace/">Docker背后的技术： Namespaces</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/08/17/callwheel/">FreeBSD里的callwheel机制(补充前一篇)</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/08/10/ndp/">RFC-2461 IPv6 NDP中NA延时的一个实现方案：异步/多实例/实时性</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/06/14/lock-free/">lock-free、网络吞吐量性能、并发及其他</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/04/27/open-vswitch/">Open vSwitch datapath浅析</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/03/31/algorithm/">编译器输出函数的算法对性能的影响</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/02/28/comments/">《Linux内核网络栈源代码情景分析》读后感</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2015/01/04/the-fight-in-rank-4d/">The Fight In Rank 4d</a>
+		</article>
+    
+
+
+
+
+    
+    
+    
+	<section class="archives">
+		<h1 class="year">2014</h1>
+
+		<article>
+    		<a href="/blog/2014/12/27/reading-2014/">My Reading in 2014</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2014/11/26/loop-unrolling/">loop unrolling : may or may not make the program run faster</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2014/08/31/ruby/">Ruby, 我的书有点乱</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2014/07/13/jin-ji-de-ccheng-xu-yuan/">进击的C程序员, Ruby, 豆瓣读书</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2014/06/24/ldscript/">性能优化，要懂点编译原理</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blog/2014/05/25/hello-github/">Hello Github!</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/501">性能优化：一些很有意思的尝试</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/482">性能优化，从linux内核里来学习，和一个例子</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/466">关于struct hack, 优雅的FreeBSD</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/455">性能优化,关于Profiling</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/435">为什么发送segment fault信号的进程总是PID0 ？</a>
+		</article>
+    
+
+
+
+
+    
+    
+    
+	<section class="archives">
+		<h1 class="year">2013</h1>
+
+		<article>
+    		<a href="/blogs/402">MacOS: mdworker曾让我很不爽</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/367">三言两语聊Kernel：linux kernel和bsd kernel实现doubly-linked list的差异</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/361">三言两语聊Kernel：atomic </a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/338">三言两语聊Kernel：该怎么理解Terminal</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/325">三言两语聊Kernel：从Linux到FreeBSD</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/316">what is the ABI(程序二进制接口)?</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/299">三言两语聊Kernel：Busy Waiting or Sleeping？</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/289">三言两语聊Kernel：do{…}while(0)</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/269">三言两语聊kernel：调度入门</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/266">三言两语聊kernel：内存管理入门</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/250">三言两语聊kernel：线程栈</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/215">三言两语聊Kernel： Undefined Instruction</a>
+		</article>
+    
+
+
+
+
+    
+    
+    
+	<section class="archives">
+		<h1 class="year">2012</h1>
+
+		<article>
+    		<a href="/blogs/197">三言两语聊Kernel：flash驱动及文件系统</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/180">《捉虫日记》书评</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/119">iPhoneOS浅浅浅浅析(4):不做学术派</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/112">iPhoneOS浅浅浅浅析（3）</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/91">iPhoneOS浅浅浅浅析（2）</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/79">iPhoneOS浅浅浅浅析</a>
+		</article>
+    
+
+
+
+
+		<article>
+    		<a href="/blogs/3">hello world!</a>
+		</article>
+    
+	</section>
+    
+
+</div>
+	<footer id="footer" class="inner">Copyright &copy; 2017
+
+    Yafang Shao
+
+</footer>
+	<script src="/javascripts/slash.js"></script>
+<script src="/javascripts/jquery.fancybox.pack.js"></script>
+<script type="text/javascript">
+(function($){
+	$('.fancybox').fancybox();
+})(jQuery);
+</script> <!-- Delete or comment this line to disable Fancybox -->
+
+
+<script type="text/javascript">
+      var disqus_shortname = 'laoar';
+      
+        
+        var disqus_script = 'count.js';
+      
+    (function () {
+      var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+      dsq.src = '//go.disqus.com/' + disqus_script;
+      (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    }());
+</script>
+
+
+
 
 
 </body>

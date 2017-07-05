@@ -1,0 +1,203 @@
+
+<!DOCTYPE HTML>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>三言两语聊Kernel：Busy Waiting or Sleeping？ - One Man's Yammer</title>
+	<meta name="author" content="Yafang Shao">
+
+	
+	<meta name="description" content="三言两语聊Kernel：Busy Waiting or Sleeping？ 在某些情况下，我们需要将当前线程的执行挂起，直至某一事件发生。这个事件可能是一个有争抢的资源变为可用，时间的流逝，或者锁的释放。这个等待可以通过两种基本的方式来实现： Busy Waiting
+Sleeping &hellip;">
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+	<link href="" rel="alternate" title="One Man's Yammer" type="application/atom+xml">
+	<link rel="canonical" href="">
+	<link href="/favicon.png" rel="shortcut icon">
+	<link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+	<!--[if lt IE 9]><script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+	<script async="true" src="//ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+	
+</head>
+
+
+<body>
+	<header id="header" class="inner"><h1><a href="/">One Man's Yammer</a></h1>
+<nav id="main-nav"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</nav>
+<nav id="mobile-nav"> <ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+ </nav>
+<!--	<div class="menu"> --!>
+		<!--<a class="button">Menu</a>
+		<div class="container"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</div>--!>
+	<!--</div>--!>
+<!--</nav>--!>
+<!-- @yfshao
+	<div class="alignright search">
+		<a class="button"></a>
+		<div class="container">
+			<form action="false" method="get">
+				<input type="text" name="q" results="0">
+				<input type="hidden" name="q" value="site:laoar.github.io">
+			</form>
+		</div>
+	</div>
+</nav>
+--!>
+<!--
+<nav id="sub-nav" class="alignright">
+	<div class="social">
+		
+		
+		
+		
+    
+		
+		
+		
+		
+		
+    
+	</div>
+	<form class="search" action="false" method="get">
+		<input class="alignright" type="text" name="q" results="0">
+		<input type="hidden" name="q" value="site:laoar.github.io">
+	</form>
+</nav>
+--!>
+<!----!>
+</header>
+	
+		
+	
+	<div id="content" class="inner"><article class="post">
+	<h2 class="title">三言两语聊Kernel：Busy Waiting or Sleeping？</h2>
+	<div class="entry-content"><p>在某些情况下，我们需要将当前线程的执行挂起，直至某一事件发生。这个事件可能是一个有争抢的资源变为可用，时间的流逝，或者锁的释放。这个等待可以通过两种基本的方式来实现：</p>
+
+<ul>
+<li>Busy Waiting</li>
+<li>Sleeping</li>
+</ul>
+
+
+<p>系统通过在循环里面旋转并且不停的去检查问题事件是否发生来实现Busy Waiting。    <br/>
+比如，如果我们想要等待5s，可以这样来实现：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">const</span> <span class="kt">int</span> <span class="n">until</span> <span class="o">=</span> <span class="n">get_time</span><span class="p">()</span> <span class="o">+</span> <span class="mi">5</span><span class="p">;</span>
+</span><span class='line'><span class="k">while</span><span class="p">(</span><span class="n">until</span> <span class="o">&gt;</span> <span class="n">get_time</span><span class="p">())</span>
+</span><span class='line'><span class="p">;</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这样做的好处是，它的实现较简单，并且如果不等太久它在性能上会表现很好，因为避免了切换到其他线程的开销。坏处也很明显：把CPU cycle浪费在执行无任何价值的东西上。       </p>
+
+<p>Busy Waiting相对于Sleeping比较容易理解。</p>
+
+<p>Sleeping通过更复杂的方式来实现：首先构造一个需要等待的线程的链表，叫作等待队列；接着把自己加入到等待队列中，控制权交给内核；然后当问题事件发生时让内核唤醒该链表里的一个（些）进程去执行。举例来说，你可能需要在某一个mutex变得可用时让内核唤醒你，于是把控制权交给内核，让内核去执行除你之外的进程，在该mutex变得可用时内核再去唤醒你。如下：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="n">mutex_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">m_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">list_add_tail</span><span class="p">(</span><span class="n">current</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">m_lock</span><span class="o">-&gt;</span><span class="n">wait_list</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">schedule</span><span class="p">();</span>
+</span><span class='line'>
+</span><span class='line'><span class="n">mutex_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">m_lock</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">wake_up_process</span><span class="p">(</span><span class="n">m_lock</span><span class="p">.</span><span class="n">wait_list</span><span class="p">.</span><span class="n">next</span><span class="o">-&gt;</span><span class="n">task</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p> Sleeping相对于Busy Waiting的好处是，内核可以在等待期间去执行有意义的事情。坏处则是它的开销：维护一个链表，让你自己去睡眠，上下文切换到一个新的进程（再加上切换回你自己）。如果等待的时间较短，显然使用Busy Waiting更合理。</p>
+</div>
+
+
+<!--
+<div class="meta">
+	<div class="date">
+
+
+
+
+
+
+
+
+  
+
+
+<time datetime="2013-08-31T00:00:00+08:00" pubdate data-updated="true">Aug 31<span>st</span>, 2013</time></div>
+	
+	<div class="comments"><a href="#disqus_thread">Comments</a></div>
+	
+</div>
+--!>
+</article>
+
+	<div class="share">
+	<div class="addthis_toolbox addthis_default_style ">
+		
+		
+		
+		
+	</div>
+	
+</div>
+
+
+
+<section id="comment">
+    <h2 class="title">Comments</h2>
+    <div id="disqus_thread" aria-live="polite"><noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+</div>
+</section>
+</div>
+	<footer id="footer" class="inner">Copyright &copy; 2017
+
+    Yafang Shao
+
+</footer>
+	<script src="/javascripts/slash.js"></script>
+<script src="/javascripts/jquery.fancybox.pack.js"></script>
+<script type="text/javascript">
+(function($){
+	$('.fancybox').fancybox();
+})(jQuery);
+</script> <!-- Delete or comment this line to disable Fancybox -->
+
+
+<script type="text/javascript">
+      var disqus_shortname = 'laoar';
+      
+        
+        // var disqus_developer = 1;
+        var disqus_identifier = 'http://laoar.github.io/blogs/299';
+        var disqus_url = 'http://laoar.github.io/blogs/299';
+        var disqus_script = 'embed.js';
+      
+    (function () {
+      var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+      dsq.src = '//go.disqus.com/' + disqus_script;
+      (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    }());
+</script>
+
+
+
+
+
+</body>
+</html>

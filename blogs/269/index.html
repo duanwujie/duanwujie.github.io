@@ -1,0 +1,223 @@
+
+<!DOCTYPE HTML>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>三言两语聊kernel：调度入门 - One Man's Yammer</title>
+	<meta name="author" content="Yafang Shao">
+
+	
+	<meta name="description" content="三言两语聊kernel：调度入门 前言 前面说了内存管理入门， 内存管理是理解linux内核的基础， 如果不了解内存管理，就无法深入了解内核，理解了内存管理，再学习内核的其他部分就会相对很容易。 这次我要说的是调度这部分， 调度在嵌入式系统中也是一个很重要的方面，众所周知， &hellip;">
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+	<link href="" rel="alternate" title="One Man's Yammer" type="application/atom+xml">
+	<link rel="canonical" href="">
+	<link href="/favicon.png" rel="shortcut icon">
+	<link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+	<!--[if lt IE 9]><script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+	<script async="true" src="//ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+	
+</head>
+
+
+<body>
+	<header id="header" class="inner"><h1><a href="/">One Man's Yammer</a></h1>
+<nav id="main-nav"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</nav>
+<nav id="mobile-nav"> <ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+ </nav>
+<!--	<div class="menu"> --!>
+		<!--<a class="button">Menu</a>
+		<div class="container"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</div>--!>
+	<!--</div>--!>
+<!--</nav>--!>
+<!-- @yfshao
+	<div class="alignright search">
+		<a class="button"></a>
+		<div class="container">
+			<form action="false" method="get">
+				<input type="text" name="q" results="0">
+				<input type="hidden" name="q" value="site:laoar.github.io">
+			</form>
+		</div>
+	</div>
+</nav>
+--!>
+<!--
+<nav id="sub-nav" class="alignright">
+	<div class="social">
+		
+		
+		
+		
+    
+		
+		
+		
+		
+		
+    
+	</div>
+	<form class="search" action="false" method="get">
+		<input class="alignright" type="text" name="q" results="0">
+		<input type="hidden" name="q" value="site:laoar.github.io">
+	</form>
+</nav>
+--!>
+<!----!>
+</header>
+	
+		
+	
+	<div id="content" class="inner"><article class="post">
+	<h2 class="title">三言两语聊kernel：调度入门</h2>
+	<div class="entry-content"><h2>前言</h2>
+
+<p>前面说了内存管理入门， 内存管理是理解linux内核的基础， 如果不了解内存管理，就无法深入了解内核，理解了内存管理，再学习内核的其他部分就会相对很容易。</p>
+
+<p>这次我要说的是调度这部分， 调度在嵌入式系统中也是一个很重要的方面，众所周知，嵌入式系统对实时性要求较高， 实时性本身就是一个调度问题。</p>
+
+<h2>进程调度的目的</h2>
+
+<p>linux进程调度是为了支持多进程，如果只是单一进程，显然是不需要调度的。 在对多进程的支持过程中， 如何合理的分配系统资源是进程调度要解决的问题，主要包括cpu该选择哪一个进程执行以及让该进程一次执行多长时间，另外一个就是smp系统的负载均衡， 即如何提高多核系统的并行执行性能。</p>
+
+<p>进程调度是针对task_running状态的进程进行调度， 如果进程不处于task_running状态，进程调度跟它就是没有关系的。 于是就引入了进程状态这个概念。</p>
+
+<h2>进程状态</h2>
+
+<p>进程状态分为:</p>
+
+<ul>
+<li>task_running状态
+task_running状态就是可以被调度的状态，内核在调度点都是选择运行队列上的一个进程来执行。</li>
+<li>睡眠状态
+睡眠状态分为两种：不可中断状态（R状态）和可中断状态（S状态），一般是进程在运行状态想获得某一个资源但是暂时又得不到，那么该进程就会进入睡眠状态，在条件成立的时候再唤醒该进程，唤醒的方式一般都是通过wake_up系列函数来唤醒。 对于S状态的进程，它还可以被信号给唤醒。</li>
+<li>task_stop状态
+task_stop状态是指正在运行的状态收到了sig_stop等一些信号而进入暂停状态， 这可以通过sig_continue信号来将其唤醒。</li>
+<li>僵死状态。
+当进程已经停止运行，但是其父进程还没有读取该子进程的exit状态时，它的task_struct就会驻留在内存中形成了僵死进程。
+
+<ul>
+<li>僵死进程的解决方法是
+一是让父进程来waitpid来接管sigchld信号  <br/>
+二是 结束它的父进程，让init进程来处理。</li>
+<li>产生的原因   <br/>
+如果父进程fork子进程时没有处理sigchld这个信号， 就会形成僵死进程,有时候可能网络原因等也会产生僵死进程。</li>
+</ul>
+</li>
+</ul>
+
+
+<h2>进程调度点</h2>
+
+<p>进程有用户态和内核态这两个状态， 即它有两个栈空间，分别时用户栈空间和内核栈空间。 在内核态下和用户态下都可以发生调度，内核态的调度发生在从中断上下文返回到内核态之前（即进程被中断打断了，中断处理完要返回的时候）， 用户态的调度发生在从内核态返回到用户态的时候（即从系统调用返回的时候。）。  内核态的调度需要打开内核抢占，如果不支持内核抢占，在内核态是不会发生调度的。</p>
+
+<p>ok， 接下来要搞清这个问题。假如我一个进程正在处于用户态，突然来了个中断，会发生什么？ 这个时候，cpu会从特权级3进入特权级0, 进程会由用户态切换到内核态（即从用户态的栈切换到内核态的栈），用户态堆栈指针会压入内核堆栈，中断执行完，首先返回到内核态，然后在从内核态返回到用户态的时候会恢复用户态堆栈。</p>
+
+<h2>进程的调度策略</h2>
+
+<p>进程按照其优先级分为实时进程和普通进程。</p>
+
+<p>实时进程的优先级较高， 实时进程又有两种调度策略：一个时FIFO，另一个是RR。对于FIFO进程而言，只有它执行完，才会选择其他进程执行（没有流控的情况下），而对于RR进程， 则是时间片轮转策略。</p>
+
+<h2>抢占</h2>
+
+<p>linux内核抢占需要在menuconfig里面打开config_preempt选项。</p>
+
+<p>用户抢占则是天生就可以的， 如果不可以， 那怎么支持多进程涅：）</p>
+
+<h2>从用户态进入内核态的情况</h2>
+
+<ul>
+<li>系统调用</li>
+<li>异常指令（其实系统调用也是一个异常指令）</li>
+<li>中断</li>
+</ul>
+
+</div>
+
+
+<!--
+<div class="meta">
+	<div class="date">
+
+
+
+
+
+
+
+
+  
+
+
+<time datetime="2013-07-29T00:00:00+08:00" pubdate data-updated="true">Jul 29<span>th</span>, 2013</time></div>
+	
+	<div class="comments"><a href="#disqus_thread">Comments</a></div>
+	
+</div>
+--!>
+</article>
+
+	<div class="share">
+	<div class="addthis_toolbox addthis_default_style ">
+		
+		
+		
+		
+	</div>
+	
+</div>
+
+
+
+<section id="comment">
+    <h2 class="title">Comments</h2>
+    <div id="disqus_thread" aria-live="polite"><noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+</div>
+</section>
+</div>
+	<footer id="footer" class="inner">Copyright &copy; 2017
+
+    Yafang Shao
+
+</footer>
+	<script src="/javascripts/slash.js"></script>
+<script src="/javascripts/jquery.fancybox.pack.js"></script>
+<script type="text/javascript">
+(function($){
+	$('.fancybox').fancybox();
+})(jQuery);
+</script> <!-- Delete or comment this line to disable Fancybox -->
+
+
+<script type="text/javascript">
+      var disqus_shortname = 'laoar';
+      
+        
+        // var disqus_developer = 1;
+        var disqus_identifier = 'http://laoar.github.io/blogs/269';
+        var disqus_url = 'http://laoar.github.io/blogs/269';
+        var disqus_script = 'embed.js';
+      
+    (function () {
+      var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+      dsq.src = '//go.disqus.com/' + disqus_script;
+      (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    }());
+</script>
+
+
+
+
+
+</body>
+</html>

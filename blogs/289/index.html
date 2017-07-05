@@ -1,0 +1,290 @@
+
+<!DOCTYPE HTML>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>三言两语聊Kernel：do{…}while(0) - One Man's Yammer</title>
+	<meta name="author" content="Yafang Shao">
+
+	
+	<meta name="description" content="三言两语聊Kernel：do{…}while(0) 在内核代码里我们会看到很多do{…}while(0)来定义的宏，比如(摘自include/asm-generic/barrier.h)： linux kernel里这么定义自然有其特殊的目的。 在C语言里，使用do/while(0) &hellip;">
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+	<link href="" rel="alternate" title="One Man's Yammer" type="application/atom+xml">
+	<link rel="canonical" href="">
+	<link href="/favicon.png" rel="shortcut icon">
+	<link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+	<!--[if lt IE 9]><script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+	<script async="true" src="//ajax.googleapis.com/ajax/libs/jquery/1.7.2/jquery.min.js"></script>
+	
+</head>
+
+
+<body>
+	<header id="header" class="inner"><h1><a href="/">One Man's Yammer</a></h1>
+<nav id="main-nav"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</nav>
+<nav id="mobile-nav"> <ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+ </nav>
+<!--	<div class="menu"> --!>
+		<!--<a class="button">Menu</a>
+		<div class="container"><ul class="main">
+	<li><a href="/read">BookWall</a></li>
+</ul>
+</div>--!>
+	<!--</div>--!>
+<!--</nav>--!>
+<!-- @yfshao
+	<div class="alignright search">
+		<a class="button"></a>
+		<div class="container">
+			<form action="false" method="get">
+				<input type="text" name="q" results="0">
+				<input type="hidden" name="q" value="site:laoar.github.io">
+			</form>
+		</div>
+	</div>
+</nav>
+--!>
+<!--
+<nav id="sub-nav" class="alignright">
+	<div class="social">
+		
+		
+		
+		
+    
+		
+		
+		
+		
+		
+    
+	</div>
+	<form class="search" action="false" method="get">
+		<input class="alignright" type="text" name="q" results="0">
+		<input type="hidden" name="q" value="site:laoar.github.io">
+	</form>
+</nav>
+--!>
+<!----!>
+</header>
+	
+		
+	
+	<div id="content" class="inner"><article class="post">
+	<h2 class="title">三言两语聊Kernel：do{…}while(0)</h2>
+	<div class="entry-content"><p>在内核代码里我们会看到很多do{…}while(0)来定义的宏，比如(摘自include/asm-generic/barrier.h)：  <br/>
+<img src="/images/289.jpg">  <br/>
+linux kernel里这么定义自然有其特殊的目的。</p>
+
+<p>在C语言里，使用do/while(0)模式来定义的宏在任何情况下都有同样的行为，而且在C语言里面，只有do/while(0)模式来定义的宏才会在任何情况下(比如，在没有“ }”的if语句中)都有同样的行为.</p>
+
+<p>举一些例子。</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="err">＃</span><span class="n">define</span> <span class="n">foo</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>  <span class="n">a</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="n">b</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于 foo(test);   <br/>
+会被展开为： a(test); b(test);</p>
+
+<p>如果是这样的话，这看起来很正确，没有任何错误，是你原本想要得到的结果。</p>
+
+<p>但如果这样用：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'>  <span class="k">if</span> <span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>  <span class="n">foo</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>它就会被展开为:</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'>   <span class="k">if</span> <span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">a</span><span class="p">(</span><span class="n">test</span><span class="p">);</span> <span class="n">b</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>它的行为就变成了:</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'>   <span class="k">if</span> <span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>      <span class="n">a</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'>      <span class="n">b</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这并不是你原本想要的。</p>
+
+<p>然后，我们重新定义该宏，使用do/while(0)来封装：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="err">＃</span><span class="n">define</span> <span class="n">foo</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">do</span><span class="p">{</span><span class="n">a</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="n">b</span><span class="p">(</span><span class="n">x</span><span class="p">)}</span><span class="k">while</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这样定义的宏和前面定义的宏具有同样的作用，只不过，do确保了它的整个逻辑都在大括号里面执行，while(0)确保它只执行一次。所以它跟没有do/while(0) 的宏具有同样的效果。那么，他们有什么不同吗？让我们再来看前面那个例子：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">if</span> <span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>    <span class="n">foo</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>现在它就变成了：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">if</span><span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>    <span class="k">do</span><span class="p">{</span><span class="n">a</span><span class="p">(</span><span class="n">test</span><span class="p">);</span> <span class="n">b</span><span class="p">(</span><span class="n">test</span><span class="p">)}</span><span class="k">while</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>实际上就是：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">if</span><span class="p">(</span><span class="n">cond</span><span class="p">){</span>
+</span><span class='line'>    <span class="n">a</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">b</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>你可能会疑问，为什么不直接使用“{}”来定义该宏？让我们来看下面这种情况：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="cp">#define foo(x) {a(x); b(x);}</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么:</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">if</span><span class="p">(</span><span class="n">cond</span><span class="p">)</span>
+</span><span class='line'>    <span class="n">foo</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'><span class="k">else</span>
+</span><span class='line'>    <span class="nf">bin</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>就变成了：</p>
+
+<figure class='code'><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class='c'><span class='line'><span class="k">if</span><span class="p">(</span><span class="n">cond</span><span class="p">){</span>
+</span><span class='line'>    <span class="n">a</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'>    <span class="n">b</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span><span class='line'><span class="p">};</span>
+</span><span class='line'><span class="k">else</span>
+</span><span class='line'>    <span class="nf">bin</span><span class="p">(</span><span class="n">test</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  <br/>
+显然这是一个语法错误，因为else前面没有if。</p>
+
+<p>使用这种方式来定义宏，还有个好处是，在&#8221;{…}&ldquo;里面可以定义自己的局部变量，而不被外面的变量所干扰。</p>
+
+<p>在linux内核代码里，很多宏都是使用do/while(0)来封装的，目的就是为了让它在任何情况下都具有同样的行为。在我们自己的代码里，也要养成这种好习惯。</p>
+</div>
+
+
+<!--
+<div class="meta">
+	<div class="date">
+
+
+
+
+
+
+
+
+  
+
+
+<time datetime="2013-08-28T00:00:00+08:00" pubdate data-updated="true">Aug 28<span>th</span>, 2013</time></div>
+	
+	<div class="comments"><a href="#disqus_thread">Comments</a></div>
+	
+</div>
+--!>
+</article>
+
+	<div class="share">
+	<div class="addthis_toolbox addthis_default_style ">
+		
+		
+		
+		
+	</div>
+	
+</div>
+
+
+
+<section id="comment">
+    <h2 class="title">Comments</h2>
+    <div id="disqus_thread" aria-live="polite"><noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+</div>
+</section>
+</div>
+	<footer id="footer" class="inner">Copyright &copy; 2017
+
+    Yafang Shao
+
+</footer>
+	<script src="/javascripts/slash.js"></script>
+<script src="/javascripts/jquery.fancybox.pack.js"></script>
+<script type="text/javascript">
+(function($){
+	$('.fancybox').fancybox();
+})(jQuery);
+</script> <!-- Delete or comment this line to disable Fancybox -->
+
+
+<script type="text/javascript">
+      var disqus_shortname = 'laoar';
+      
+        
+        // var disqus_developer = 1;
+        var disqus_identifier = 'http://laoar.github.io/blogs/289';
+        var disqus_url = 'http://laoar.github.io/blogs/289';
+        var disqus_script = 'embed.js';
+      
+    (function () {
+      var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+      dsq.src = '//go.disqus.com/' + disqus_script;
+      (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+    }());
+</script>
+
+
+
+
+
+</body>
+</html>
